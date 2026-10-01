@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- macOS shows these texts when asking the user for permission. -->
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Voice Desk listens to your microphone to transcribe dictation and meetings.</string>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>Voice Desk records meeting audio playing on your computer to find tasks assigned to you.</string>
+</dict>
+</plist>

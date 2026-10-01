@@ -1,0 +1,14 @@
+# Speech engine dependencies. Install into the project's venv:
+#   Windows:      py -m venv .venv && .venv\Scripts\pip install -r engine/requirements.txt
+#   macOS/Linux:  python3 -m venv .venv && .venv/bin/pip install -r engine/requirements.txt
+faster-whisper>=1.2
+pyannote.audio>=4.0
+numpy>=2.0
+psutil>=5.9  # cores/RAM, to size models and threads to the computer
+onnxruntime>=1.17  # voice ID model, IndicConformer
+transformers>=4.40  # IndicConformer (Hindi/Gujarati script)
+onnx>=1.16  # shrinking IndicConformer to int8 (once)
+
+# NVIDIA GPU acceleration for Whisper (Windows/Linux only; harmless without a GPU).
+nvidia-cublas-cu12; sys_platform != "darwin"
+nvidia-cudnn-cu12==9.*; sys_platform != "darwin"
