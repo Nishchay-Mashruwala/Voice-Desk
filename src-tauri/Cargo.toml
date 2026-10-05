@@ -1,6 +1,6 @@
 [package]
 name = "voicedesk"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local voice dictation and meeting task extraction"
 authors = ["Rajvee"]
 edition = "2021"
