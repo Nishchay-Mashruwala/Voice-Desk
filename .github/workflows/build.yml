@@ -26,11 +26,12 @@ jobs:
       - name: Versions match the tag, every module is committed
         run: python scripts/check-release.py ${{ github.ref_type == 'tag' && github.ref_name || '' }}
 
-      # The engine's unit tests only need NumPy (the heavy packages are imported lazily).
+      # The engine's own packages, pinned as friends get them (the chunking tests
+      # use faster-whisper's speech detector). No models are downloaded.
       - name: Engine tests
         working-directory: engine
         run: |
-          python -m pip install numpy -c constraints.txt
+          python -m pip install -r requirements.txt -c constraints.txt
           python test_commands.py
           python test_speakers.py
           python test_mixed.py
