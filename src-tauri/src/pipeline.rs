@@ -6,7 +6,7 @@ use tauri::{AppHandle, Emitter};
 
 use crate::db::Segment;
 use crate::llm::Mode;
-use crate::Shared;
+use crate::{err, Shared};
 
 pub enum Input {
     /// Meetings page: transcribe the saved mic + system WAVs.
@@ -18,13 +18,15 @@ pub enum Input {
     Reextract,
 }
 
-fn err(e: impl std::fmt::Display) -> String {
-    e.to_string()
-}
-
 /// Returns the number of tasks found.
 pub async fn process(app: AppHandle, st: Shared, id: i64, input: Input) -> Result<usize, String> {
     let result = run(&app, &st, id, input).await;
+    // Processed: keep the recording as FLAC (lossless, ~1/3 of the WAV's size).
+    let (mic, sys) = st.meeting_paths(id);
+    let wavs: Vec<_> = [mic, sys].into_iter().filter(|p| p.exists()).collect();
+    if !wavs.is_empty() {
+        let _ = st.engine.request("compress", json!({ "paths": wavs }), None).await;
+    }
     if let Err(e) = &result {
         let _ = st.db.set_meeting_status(id, "error", Some(e));
     }
@@ -66,15 +68,16 @@ async fn run(app: &AppHandle, st: &Shared, id: i64, input: Input) -> Result<usiz
         let profile = st.voice_profile_path();
         let capture = mic_segments.is_some();
         let mut args = json!({
-            "mic_path": (!capture && mic_path.exists()).then_some(&mic_path),
+            "mic_path": if capture { None } else { crate::audio::recorded(&mic_path) },
             "mic_segments": mic_segments,
-            "system_path": sys_path.exists().then_some(&sys_path),
+            "system_path": crate::audio::recorded(&sys_path),
             "model": settings.whisper_model,
-            "device": settings.whisper_device,
+            "device": settings.device,
             "language": settings.language,
             "vocabulary": settings.whisper_vocabulary(),
             "hf_token": settings.hf_token,
             "voice_profile": profile.exists().then_some(&profile),
+            "people": st.db.people().unwrap_or_default(),
         });
         crate::session::merge_json(&mut args, settings.language_options());
         let res = st.engine.request("meeting", args, Some(on_event)).await.map_err(err)?;

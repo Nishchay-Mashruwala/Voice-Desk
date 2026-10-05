@@ -4,9 +4,12 @@
 //! gaming PCs, so the device and thread choices are made from what's here.
 
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use sysinfo::{Pid, ProcessesToUpdate, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Gpu {
@@ -36,15 +39,39 @@ fn quiet(cmd: &mut Command) -> &mut Command {
     cmd
 }
 
+/// No nvidia-smi on this computer (no NVIDIA driver): don't keep trying.
+static NO_NVIDIA: AtomicBool = AtomicBool::new(false);
+
 /// NVIDIA GPUs (the only kind the speech and task models can use), with free memory.
 pub fn gpus() -> Vec<Gpu> {
+    if NO_NVIDIA.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
     let out = quiet(Command::new("nvidia-smi").args([
         "--query-gpu=index,name,memory.total,memory.free",
         "--format=csv,noheader,nounits",
     ]))
     .output();
-    let Ok(out) = out else { return Vec::new() };
+    let Ok(out) = out else {
+        NO_NVIDIA.store(true, Ordering::Relaxed);
+        return Vec::new();
+    };
     parse_gpus(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// `gpus()` at most every 10 s: nvidia-smi takes ~0.1-0.3 s of CPU, and the
+/// Storage page polls usage every few seconds.
+fn gpus_cached() -> Vec<Gpu> {
+    static CACHE: Mutex<Option<(Instant, Vec<Gpu>)>> = Mutex::new(None);
+    let mut c = CACHE.lock().unwrap();
+    match c.as_ref() {
+        Some((at, g)) if at.elapsed() < Duration::from_secs(10) => g.clone(),
+        _ => {
+            let g = gpus();
+            *c = Some((Instant::now(), g.clone()));
+            g
+        }
+    }
 }
 
 fn parse_gpus(csv: &str) -> Vec<Gpu> {
@@ -92,44 +119,29 @@ pub struct Usage {
     pub app_gb: f64,
     /// Speech engine, plus speaker detection while it runs.
     pub speech_gb: f64,
-    /// Ollama and its model, while loaded.
+    /// The task AI (llama-server and its model), while running.
     pub task_ai_gb: f64,
     /// Whole GPU memory in use (Windows doesn't report it per app), if there's an NVIDIA GPU.
     pub gpu_used_gb: Option<f64>,
     pub gpu_total_gb: Option<f64>,
 }
 
-/// RAM in use right now by Voice Desk's parts.
-pub fn usage() -> Usage {
-    let mut sys = System::new();
-    sys.refresh_processes(ProcessesToUpdate::All, true);
+/// RAM in use right now by Voice Desk's parts: the app, and the processes it
+/// started (speech engine, task AI). Only those are read, not every process
+/// on the computer (hundreds, each opened to read its details).
+pub fn usage(engine: Option<u32>, task_ai: Option<u32>) -> Usage {
     let me = Pid::from_u32(std::process::id());
-    let mem = |pid: Pid| sys.process(pid).map_or(0, |p| p.memory());
-    // Descendants of the app: the speech engine, its speaker-detection helper, and an Ollama we started.
-    let is_below = |mut pid: Pid| {
-        while let Some(parent) = sys.process(pid).and_then(|p| p.parent()) {
-            if parent == me {
-                return true;
-            }
-            pid = parent;
-        }
-        false
-    };
-    let (mut speech, mut ai) = (0u64, 0u64);
-    for (pid, p) in sys.processes() {
-        let name = p.name().to_string_lossy().to_lowercase();
-        if name.contains("ollama") {
-            ai += p.memory();
-        } else if *pid != me && is_below(*pid) {
-            speech += p.memory();
-        }
-    }
-    let gpu = gpus();
+    let (engine, task_ai) = (engine.map(Pid::from_u32), task_ai.map(Pid::from_u32));
+    let pids: Vec<Pid> = [Some(me), engine, task_ai].into_iter().flatten().collect();
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&pids), true, ProcessRefreshKind::nothing().with_memory());
+    let mem = |pid: Option<Pid>| pid.and_then(|p| sys.process(p)).map_or(0, |p| p.memory());
+    let gpu = gpus_cached();
     let gb = |b: u64| b as f64 / 1e9;
     Usage {
-        app_gb: gb(mem(me)),
-        speech_gb: gb(speech),
-        task_ai_gb: gb(ai),
+        app_gb: gb(mem(Some(me))),
+        speech_gb: gb(mem(engine)),
+        task_ai_gb: gb(mem(task_ai)),
         gpu_used_gb: (!gpu.is_empty()).then(|| gpu.iter().map(|g| g.total_gb - g.free_gb).sum()),
         gpu_total_gb: (!gpu.is_empty()).then(|| gpu.iter().map(|g| g.total_gb).sum()),
     }

@@ -20,6 +20,7 @@ it return empty text.
 
 from __future__ import annotations
 
+import gc
 import importlib.util
 import os
 import subprocess
@@ -31,12 +32,27 @@ import types
 import numpy as np
 
 REPO = "ai4bharat/indic-conformer-600m-multilingual"
+DOWNLOAD_NAME = "Hindi/Gujarati model (IndicConformer)"
 # Languages it writes (of the ones Voice Desk offers).
 LANGS = {"hi", "gu", "mr", "bn", "pa", "ta", "te", "kn", "ml", "ur", "ne", "or", "as", "sa", "sd"}
 # Longer inputs are split, at pauses where possible. Measured on the user's
 # recordings: up to 14 s is always decoded fully, but from ~16 s the output is
 # erratic, often empty or missing the start (the model saw short utterances).
 MAX_CHUNK_S = 12
+# RNNT silent this long: CTC's words are used there (`IndicASR._ctc_fill`).
+CTC_FILL_S = 2.0
+
+
+def uncovered(words: list[dict], start: float, end: float, min_s: float) -> list[tuple[float, float]]:
+    """Stretches of at least `min_s` within [start, end) without any of `words` ({"s", "e"})."""
+    out, at = [], start
+    for w in sorted(words, key=lambda w: w["s"]):
+        if w["s"] - at >= min_s:
+            out.append((at, w["s"]))
+        at = max(at, w["e"])
+    if end - at >= min_s:
+        out.append((at, end))
+    return out
 
 
 def log(*args) -> None:
@@ -53,83 +69,208 @@ def quantize(src: str, dst: str) -> None:
     os.replace(tmp, dst)
 
 
+def int8_path(snapshot: str) -> str:
+    from runtime import models_dir
+
+    return os.path.join(models_dir(), f"indic-encoder-int8-{os.path.basename(snapshot)}.onnx")
+
+
+def local_snapshot() -> str | None:
+    """The downloaded model's folder, if it's usable without the internet.
+
+    Not `snapshot_download(local_files_only=True)`: once the int8 copy exists the
+    full-size weights are deleted, and huggingface_hub then calls the snapshot
+    incomplete. That made every start download 2.4 GB again, and offline
+    Hindi/Gujarati didn't work at all."""
+    from huggingface_hub import try_to_load_from_cache
+
+    found = try_to_load_from_cache(REPO, "model_onnx.py")
+    if not isinstance(found, str):
+        return None
+    snapshot = os.path.dirname(found)
+    if os.path.exists(int8_path(snapshot)) or float_encoder_complete(snapshot):
+        return snapshot
+    return None
+
+
 def int8_encoder(snapshot: str) -> str | None:
-    """Path of the cached int8 encoder, creating it (~1 min, once) if needed.
+    """Path of the int8 encoder, creating it (~1 min, once) if needed.
     Runs in a child process: quantizing briefly takes several GB of RAM."""
-    cache = os.path.join(os.path.expanduser("~"), ".cache", "voicedesk")
-    dst = os.path.join(cache, f"indic-encoder-int8-{os.path.basename(snapshot)}.onnx")
+    name = os.path.basename(int8_path(snapshot))
+    dst = int8_path(snapshot)
+    old = os.path.join(os.path.expanduser("~"), ".cache", "voicedesk", name)  # before models_dir()
+    if not os.path.exists(dst) and os.path.exists(old):
+        os.replace(old, dst)
     if os.path.exists(dst):
+        prune_float_encoder(snapshot)
         return dst
-    os.makedirs(cache, exist_ok=True)
+    src = os.path.join(snapshot, "assets", "encoder.onnx")
+    if not float_encoder_complete(snapshot):
+        return None  # originals were pruned and the copy is gone: the caller downloads them again
     log("making a smaller copy of the model (once, about a minute)...")
     proc = subprocess.run(
-        [sys.executable, os.path.abspath(__file__), "--quantize", os.path.join(snapshot, "assets", "encoder.onnx"), dst],
+        [sys.executable, os.path.abspath(__file__), "--quantize", src, dst],
         stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=1800,
         creationflags=0x08000000 if os.name == "nt" else 0,  # CREATE_NO_WINDOW
     )
     if proc.returncode != 0 or not os.path.exists(dst):
         log(f"quantizing failed, using the full-size model: {proc.stderr.strip().splitlines()[-1:]}")
         return None
+    prune_float_encoder(snapshot)
     return dst
 
 
+def _encoder_weight_files(snapshot: str) -> list[str]:
+    """The full-size encoder's weight files (366 files, ~2.4 GB, next to encoder.onnx)."""
+    import onnx
+
+    assets = os.path.join(snapshot, "assets")
+    model = onnx.load(os.path.join(assets, "encoder.onnx"), load_external_data=False)
+    names = {e.value for t in model.graph.initializer for e in t.external_data if e.key == "location"}
+    return [os.path.join(assets, n) for n in names]
+
+
+def float_encoder_complete(snapshot: str) -> bool:
+    try:
+        return all(os.path.exists(f) for f in _encoder_weight_files(snapshot))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def prune_float_encoder(snapshot: str) -> None:
+    """Once the int8 copy exists the full-size weights are never read: free ~2.4 GB."""
+    try:
+        files = [f for f in _encoder_weight_files(snapshot) if os.path.exists(f)]
+    except Exception as e:  # noqa: BLE001
+        log(f"couldn't list the full-size encoder: {e}")
+        return
+    freed = 0
+    for f in files:
+        try:
+            freed += os.path.getsize(f)
+            os.remove(f)
+        except OSError:
+            pass
+    if freed:
+        log(f"removed the full-size encoder ({freed / 1e9:.1f} GB); the int8 copy is used")
+
+
+def _louder(piece: np.ndarray) -> np.ndarray:
+    """The user's mic records quietly (peaks 0.02-0.07); at that level the model
+    dropped whole sentences. Raised to a 0.5 peak, it kept them."""
+    peak = float(np.abs(piece).max()) if len(piece) else 0.0
+    return piece * min(0.5 / peak, 30.0) if 0 < peak < 0.5 else piece
+
+
 class IndicASR:
+    # After failing to load (no internet, terms not accepted yet...), try again
+    # this much later, or at once with a different Hugging Face token. It used
+    # to stay off until Voice Desk was restarted.
+    RETRY_AFTER_S = 10 * 60
+
     def __init__(self) -> None:
         self.model = None
         self.failed: str | None = None  # why loading failed; don't retry every phrase
+        self.failed_at = 0.0
+        self.failed_token: str | None = None
         self.last_used = time.time()
-        self._lock = threading.Lock()
+        self._load_lock = threading.Lock()  # held while loading: minutes when downloading
+        self._run_lock = threading.Lock()  # one decoding at a time
 
     @property
     def loaded(self) -> bool:
         return self.model is not None
 
     @property
+    def loading(self) -> bool:
+        return self._load_lock.locked()
+
+    @property
     def usable(self) -> bool:
-        """Can be used (or loaded) — i.e. it hasn't failed to load."""
-        return self.failed is None
+        """Can be used (or loaded): it hasn't failed to load, or long enough ago to try again."""
+        return self.failed is None or time.time() - self.failed_at >= self.RETRY_AFTER_S
+
+    def _may_try(self, hf_token: str | None) -> bool:
+        return self.usable or bool(hf_token and hf_token != self.failed_token)
+
+    def load_in_background(self, hf_token: str | None = None) -> None:
+        """Start loading without waiting for it (live dictation doesn't wait)."""
+        if not self.loaded and not self.loading and self._may_try(hf_token):
+            threading.Thread(target=self.load, args=(hf_token,), daemon=True).start()
 
     def load(self, hf_token: str | None = None) -> bool:
         """Load once; returns False (and remembers why) if it can't be used."""
-        with self._lock:
+        if self.model is not None:  # no lock: checked for every phrase, and loading holds it for minutes
+            return True
+        with self._load_lock:
             if self.model is not None:
                 return True
-            if self.failed:
+            if not self._may_try(hf_token):
                 return False
             try:
-                from huggingface_hub import snapshot_download
+                from runtime import hub_snapshot
 
                 t = time.time()
-                try:
-                    path = snapshot_download(REPO, local_files_only=True)
-                except Exception:  # noqa: BLE001 — not downloaded yet
+                token = hf_token or os.environ.get("HF_TOKEN") or None
+                path = local_snapshot()
+                if path is None:
                     log("downloading IndicConformer (2.4 GB)...")
-                    path = snapshot_download(REPO, token=hf_token or os.environ.get("HF_TOKEN") or None)
+                    path = hub_snapshot(REPO, DOWNLOAD_NAME, token)
                 # The repo's own inference code (transformers "remote code"), loaded
                 # from the local snapshot so no network is needed after the download.
                 spec = importlib.util.spec_from_file_location("indic_conformer_onnx", os.path.join(path, "model_onnx.py"))
                 mod = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(mod)
+                # PyTorch (the model's feature extractor) has a second thread pool
+                # that ignores OMP_NUM_THREADS: it briefly used ~11 of 16 threads.
+                import torch
+
+                torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS") or 2))
+                try:
+                    torch.set_num_interop_threads(1)
+                except RuntimeError:  # only allowed before the first parallel work
+                    pass
                 encoder = int8_encoder(path)
+                if encoder is None and not float_encoder_complete(path):
+                    log("downloading the model's full-size encoder again to rebuild the small copy...")
+                    path = hub_snapshot(REPO, DOWNLOAD_NAME, token)
+                    encoder = int8_encoder(path)
                 mod.ort = types.SimpleNamespace(InferenceSession=_session_factory(encoder))
                 self.model = mod.IndicASRModel(mod.IndicASRConfig(ts_folder=path, FRAME_DURATION_MS=0.08))
+                self.failed = None
                 log(f"ready in {time.time() - t:.1f}s")
                 return True
             except Exception as e:  # noqa: BLE001
                 msg = str(e)
                 if "gated" in msg.lower() or "403" in msg:
                     msg = f"accept the model's terms at https://huggingface.co/{REPO} ({msg.splitlines()[0]})"
-                self.failed = msg
-                log(f"unavailable, using Whisper instead: {msg}")
+                self.failed, self.failed_at, self.failed_token = msg, time.time(), hf_token
+                log(f"unavailable, using Whisper instead (trying again in {self.RETRY_AFTER_S // 60} min): {msg}")
                 return False
 
     def unload(self) -> None:
-        with self._lock:
+        """Free its ~1 GB of RAM. A decoding still running keeps its own reference."""
+        with self._load_lock:
             self.model = None
-            self.failed = None
+        gc.collect()
 
-    def transcribe(self, audio: np.ndarray, lang: str, choices: list[str] | None = None) -> tuple[str, str]:
-        """(text, language) of 16 kHz mono float32 audio, in the language's script.
+    def pick(self, audio: np.ndarray, prefer: str, choices: list[str]) -> str:
+        """Which of `choices` (e.g. ["hi", "gu"]) this speech is in, from its
+        first chunk (see `_pick`); `prefer` unless another clearly fits better."""
+        import torch
+
+        model = self.model
+        piece = audio[: MAX_CHUNK_S * 16000]
+        if model is None or len(piece) < 1600:
+            return prefer
+        self.last_used = time.time()
+        with self._run_lock, torch.inference_mode():
+            enc, _ = model.encode(torch.from_numpy(np.ascontiguousarray(_louder(piece))).unsqueeze(0))
+            return self._pick(model, enc, prefer, choices)
+
+    def transcribe_words(self, audio: np.ndarray, lang: str, choices: list[str] | None = None) -> tuple[list[dict], str]:
+        """([{"w", "s", "e"}], language) of 16 kHz mono float32 audio, in the
+        language's script; times in seconds from the start of `audio`.
 
         `choices` (e.g. ["hi", "gu"]): the language is picked among these from
         the first chunk's sound, staying with `lang` unless another clearly fits
@@ -141,24 +282,88 @@ class IndicASR:
             raise RuntimeError("IndicConformer not loaded")
         self.last_used = time.time()
         step = MAX_CHUNK_S * 16000
-        parts = []
-        with self._lock, torch.inference_mode():
+        words: list[dict] = []
+        with self._run_lock, torch.inference_mode():
             for i in range(0, len(audio), step):
                 piece = audio[i : i + step]
                 if len(piece) < 1600:  # < 0.1 s
                     continue
-                # The user's mic records quietly (peaks 0.02-0.07); at that level the
-                # model dropped whole sentences. Raised to a 0.5 peak, it kept them.
-                peak = float(np.abs(piece).max())
-                if 0 < peak < 0.5:
-                    piece = piece * min(0.5 / peak, 30.0)
-                enc, lens = model.encode(torch.from_numpy(np.ascontiguousarray(piece)).unsqueeze(0))
+                enc, lens = model.encode(torch.from_numpy(np.ascontiguousarray(_louder(piece))).unsqueeze(0))
                 if i == 0 and choices and len(choices) > 1:
-                    lang = self._pick(enc, lang, choices)
+                    lang = self._pick(model, enc, lang, choices)
                 # RNNT decoding: more accurate than CTC on the user's recordings.
-                parts.append(model._rnnt_decode(enc, lens, lang))
+                offset = i / 16000
+                rnnt = self._decode_words(model, enc, lang, offset)
+                fill = self._ctc_fill(model, enc, lens, lang, rnnt, offset, len(piece) / 16000)
+                words += sorted(rnnt + fill, key=lambda w: w["s"])
         self.last_used = time.time()
-        return " ".join(p for p in parts if p).strip(), lang
+        return words, lang
+
+    @staticmethod
+    def _ctc_fill(model, enc, lens, lang: str, rnnt: list[dict], offset: float, seconds: float) -> list[dict]:
+        """CTC's words where RNNT wrote nothing for CTC_FILL_S or longer.
+
+        RNNT decoding sometimes outputs nothing at all for a stretch, or a whole
+        chunk, depending only on where the audio starts (17.0-22.0 s of the
+        user's test meeting came out right, 17.6-22.0 s and 16.0-23.0 s empty),
+        while CTC on the same encoder output still has the words (rougher). It
+        costs one small extra step."""
+        gaps = uncovered(rnnt, offset, offset + seconds, CTC_FILL_S)
+        if not gaps:
+            return []
+        logprobs = model.models["ctc_decoder"].run(["logprobs"], {"encoder_output": enc})[0][0]
+        path = np.argmax(logprobs[: int(lens[0]), model.language_masks[lang]], axis=-1)
+        # Greedy CTC: a token repeated over frames counts once; blanks separate.
+        pieces, prev = [], None
+        for t, token in enumerate(path.tolist()):
+            if token != prev and token != model.config.BLANK_ID:
+                pieces.append((model.vocab[lang][token], t))
+            prev = token
+        fill = [
+            dict(w, ctc=True)
+            for w in _words(pieces, offset, float(model.config.FRAME_DURATION_MS))
+            if any(a <= (w["s"] + w["e"]) / 2 < b for a, b in gaps)
+        ]
+        if fill:
+            log(f"{len(fill)} words from CTC where RNNT wrote nothing")
+        return fill
+
+    @staticmethod
+    def _decode_words(model, enc, lang: str, offset: float) -> list[dict]:
+        """The model's own greedy RNNT decoding (`_rnnt_decode`, same steps and
+        text), also noting the encoder frame each piece came out at: words get
+        real times instead of being spread evenly over the phrase."""
+        import torch
+
+        cfg = model.config
+        joint_enc = torch.from_numpy(model.models["joint_enc"].run(["output"], {"input": enc.transpose(0, 2, 1)})[0])
+        hyp = [cfg.SOS]
+        frames: list[int] = []
+        state = (
+            np.zeros((cfg.PRED_RNN_LAYERS, 1, cfg.PRED_RNN_HIDDEN_DIM), dtype=np.float32),
+            np.zeros((cfg.PRED_RNN_LAYERS, 1, cfg.PRED_RNN_HIDDEN_DIM), dtype=np.float32),
+        )
+        for t in range(joint_enc.size(1)):
+            f = joint_enc[:, t, :].unsqueeze(1)
+            added = 0
+            while cfg.RNNT_MAX_SYMBOLS is None or added < cfg.RNNT_MAX_SYMBOLS:
+                g, _, s0, s1 = model.models["rnnt_decoder"].run(
+                    ["outputs", "prednet_lengths", "states", "162"],
+                    {"targets": np.array([[hyp[-1]]], dtype=np.int32), "target_length": np.array([1], dtype=np.int32),
+                     "states.1": state[0], "onnx::Slice_3": state[1]},
+                )
+                g = model.models["joint_pred"].run(["output"], {"input": g.transpose(0, 2, 1)})[0]
+                joint = model.models["joint_pre_net"].run(["output"], {"input": (f + g).numpy()})[0]
+                logits = model.models[f"joint_post_net_{lang}"].run(["output"], {"input": joint})[0]
+                token = int(np.argmax(logits, axis=-1).item())
+                added += 1
+                if token == cfg.BLANK_ID:
+                    break
+                hyp.append(token)
+                frames.append(t)
+                state = (s0, s1)
+        pieces = [(model.vocab[lang][token], t) for token, t in zip(hyp[1:], frames)]
+        return _words(pieces, offset, float(cfg.FRAME_DURATION_MS))
 
     # How much better (mean log-prob per letter) another language must fit to
     # override the preferred one. Measured on the user's recordings: Hindi fits
@@ -166,12 +371,11 @@ class IndicASR:
     # Gujarati speech.
     PICK_MARGIN = 0.08
 
-    def _pick(self, enc, prefer: str, choices: list[str]) -> str:
+    def _pick(self, model, enc, prefer: str, choices: list[str]) -> str:
         """Which language's letters explain the audio best, from the CTC head:
         each language's vocabulary is scored on its own, on non-silent frames."""
         import torch
 
-        model = self.model
         logprobs = model.models["ctc_decoder"].run(["logprobs"], {"encoder_output": enc})[0][0]
         scores = {}
         for code in choices:
@@ -189,6 +393,24 @@ class IndicASR:
         return choice
 
 
+def _words(pieces: list[tuple[str, int]], offset: float, step: float) -> list[dict]:
+    """Decoded pieces ("▁ગુ", "જ", ...) with their encoder frame -> words with
+    times (s). "▁" starts a word; `step`: seconds per frame (0.08)."""
+    words: list[dict] = []
+    for piece, t in pieces:
+        at = round(offset + t * step, 2)
+        text = piece.replace("▁", "")
+        if piece.startswith("▁") or not words:
+            if words and not words[-1]["w"]:
+                words.pop()  # a lone "▁" before this one
+            words.append({"w": "", "s": at, "e": at})
+        if text and not words[-1]["w"]:
+            words[-1]["s"] = at
+        words[-1]["w"] += text
+        words[-1]["e"] = round(at + step, 2)
+    return [w for w in words if w["w"].strip()]
+
+
 def _session_factory(encoder: str | None):
     """onnxruntime sessions for the model's loader: the int8 encoder instead of
     the float32 one, and no memory arena (it kept the largest input's buffers)."""
@@ -202,6 +424,10 @@ def _session_factory(encoder: str | None):
         # onnxruntime would use every core; share them with the rest of the computer.
         opts.intra_op_num_threads = int(os.environ.get("OMP_NUM_THREADS") or 2)
         opts.inter_op_num_threads = 1
+        # Idle worker threads would otherwise spin, burning CPU between steps:
+        # measured ~9-11 cores busy while decoding with a 4-thread limit.
+        opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        opts.add_session_config_entry("session.inter_op.allow_spinning", "0")
         return ort.InferenceSession(path, opts, providers=providers)
 
     return session

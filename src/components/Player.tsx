@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from "react";
-import { api, formatDuration, type SourceFocus, type Word } from "../api";
+import { memo, useEffect, useRef, useState } from "react";
+import { api, audioBlob, formatDuration, type SourceFocus, type Word } from "../api";
 import { quoteStart, taskOfWords, type TaskMark } from "../taskMarks";
 import { toast } from "../toast";
 import { Pause, Play } from "../icons";
+import { retimeWords } from "../retime";
 
 // Only one recording plays at a time.
 let playing: HTMLAudioElement | null = null;
@@ -17,8 +18,9 @@ const STATUS_HINT: Record<string, string> = {
 /**
  * Plays a listening session's recording with its transcript underneath.
  * Words light up as they are spoken; click any word to jump there.
+ * Memoised: the Listen page re-renders often while listening, history doesn't need to.
  */
-export default function Player({
+export default memo(function Player({
   id,
   words,
   text,
@@ -26,6 +28,8 @@ export default function Player({
   durationS,
   tasks = [],
   focus,
+  editing = false,
+  onEdited,
 }: {
   id: number;
   words: Word[] | null;
@@ -35,7 +39,24 @@ export default function Player({
   tasks?: TaskMark[];
   /** Play from just before where a task was said. */
   focus?: SourceFocus;
+  /** Show the text as an editor (to fix misheard words). */
+  editing?: boolean;
+  /** Edited (saved, or `null`: cancelled). Gets the id so one stable callback serves every row. */
+  onEdited?: (id: number, saved: { text: string; words: Word[] } | null) => void;
 }) {
+  const [draft, setDraft] = useState(text);
+  useEffect(() => setDraft(text), [text, editing]);
+  const saveEdit = async () => {
+    const t = draft.trim();
+    if (!t) return;
+    const timed = retimeWords(words ?? [], t, 0, durationS);
+    try {
+      await api.updateDictationText(id, t, timed);
+      onEdited?.(id, { text: t, words: timed });
+    } catch (e) {
+      toast(`Couldn't save: ${e}`);
+    }
+  };
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const urlRef = useRef<string | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -44,13 +65,16 @@ export default function Player({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(
-    () => () => {
+  // False once unmounted: audio still loading then must not be created or played.
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
       audioRef.current?.pause();
       if (urlRef.current) URL.revokeObjectURL(urlRef.current);
-    },
-    [],
-  );
+    };
+  }, []);
 
   // Smooth highlighting: follow the playhead every frame while playing.
   useEffect(() => {
@@ -69,7 +93,8 @@ export default function Player({
     setLoading(true);
     try {
       const bytes = await api.dictationAudio(id);
-      const url = URL.createObjectURL(new Blob([bytes], { type: "audio/wav" }));
+      if (!alive.current) return null;
+      const url = URL.createObjectURL(audioBlob(bytes));
       urlRef.current = url;
       const a = new Audio(url);
       a.onloadedmetadata = () => isFinite(a.duration) && setDuration(a.duration);
@@ -84,16 +109,16 @@ export default function Player({
       audioRef.current = a;
       return a;
     } catch (e) {
-      setError(String(e));
+      if (alive.current) setError(String(e));
       return null;
     } finally {
-      setLoading(false);
+      if (alive.current) setLoading(false);
     }
   };
 
   const play = async (from?: number) => {
     const a = await ensureAudio();
-    if (!a) return;
+    if (!a || !alive.current) return;
     if (playing && playing !== a) playing.pause();
     playing = a;
     if (from !== undefined) {
@@ -112,8 +137,8 @@ export default function Player({
       toast("The audio for this recording is no longer available");
       return;
     }
-    const at = words && words.length > 0 ? quoteStart(words, focus.quote) : null;
-    if (at === null) toast("Couldn't find where this task was said — playing from the start");
+    const at = focus.atS ?? (words && words.length > 0 ? quoteStart(words, focus.quote) : null);
+    if (at === null && focus.quote) toast("Couldn't find where this task was said — playing from the start");
     play(Math.max(0, (at ?? 0) - focus.leadS));
   }, [focus]);
 
@@ -147,7 +172,23 @@ export default function Player({
         </div>
       )}
       {error && <div className="small bad">{error}</div>}
-      {words && words.length > 0 ? (
+      {editing ? (
+        <div className="seg-edit">
+          <textarea
+            autoFocus
+            value={draft}
+            rows={Math.min(10, Math.ceil(draft.length / 80) + 2)}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => e.key === "Escape" && onEdited?.(id, null)}
+          />
+          <div className="row">
+            <button className="primary" onClick={saveEdit} disabled={!draft.trim()}>
+              Save
+            </button>
+            <button onClick={() => onEdited?.(id, null)}>Cancel</button>
+          </div>
+        </div>
+      ) : words && words.length > 0 ? (
         <p className={`karaoke ${started ? "" : "idle"}`}>
           {words.map((w, i) => {
             const state = time >= w.e ? "spoken" : time >= w.s ? "now" : "";
@@ -180,4 +221,4 @@ export default function Player({
       )}
     </div>
   );
-}
+});

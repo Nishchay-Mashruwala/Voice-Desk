@@ -85,6 +85,13 @@ export const Check = (p: P) => (
     <path d="M5 12.5l4.5 4.5L19 7.5" />
   </Svg>
 );
+export const Search = (p: P) => (
+  <Svg {...p}>
+    <circle cx="11" cy="11" r="7" />
+    <path d="m20 20-3.5-3.5" />
+  </Svg>
+);
+
 export const X = (p: P) => (
   <Svg {...p}>
     <path d="M6 6l12 12M18 6L6 18" />
@@ -130,5 +137,10 @@ export const External = (p: P) => (
 export const ChevronLeft = (p: P) => (
   <Svg {...p}>
     <path d="M14.5 6l-6 6 6 6" />
+  </Svg>
+);
+export const ChevronDown = (p: P) => (
+  <Svg {...p}>
+    <path d="M6 9.5l6 6 6-6" />
   </Svg>
 );

@@ -14,9 +14,25 @@ fn window(app: &AppHandle) -> Option<WebviewWindow> {
 
 /// Prepare the overlay window once at startup.
 pub fn init(app: &AppHandle) {
+    native::no_ghost_frames();
     if let Some(w) = window(app) {
         native::strip_frame(&w);
+        set_rendering(&w, false);
     }
+}
+
+/// Tell the web view whether it's on screen. The window is shown/hidden with
+/// Win32 calls (to never take focus), which WebView2 doesn't notice: hidden,
+/// it kept drawing and running timers (~13% of a core with "CPU only").
+fn set_rendering(w: &WebviewWindow, on: bool) {
+    let _ = w.with_webview(move |wv| {
+        #[cfg(windows)]
+        unsafe {
+            let _ = wv.controller().SetIsVisible(on);
+        }
+        #[cfg(not(windows))]
+        let _ = (wv, on);
+    });
 }
 
 pub fn show(app: &AppHandle, st: &Shared) {
@@ -25,6 +41,7 @@ pub fn show(app: &AppHandle, st: &Shared) {
         return;
     }
     place(&w, st);
+    set_rendering(&w, true);
     native::show_without_focus(&w);
 }
 
@@ -32,6 +49,7 @@ pub fn hide(app: &AppHandle, st: &Shared) {
     let Some(w) = window(app) else { return };
     if native::is_visible(&w) {
         native::hide(&w);
+        set_rendering(&w, false);
         save(st);
     }
 }
@@ -103,6 +121,15 @@ mod native {
         fn GetWindowLongPtrW(hwnd: *mut c_void, index: i32) -> isize;
         fn SetWindowLongPtrW(hwnd: *mut c_void, index: i32, value: isize) -> isize;
         fn SetWindowPos(hwnd: *mut c_void, after: *mut c_void, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
+        fn DisableProcessWindowsGhosting();
+    }
+
+    /// When the app is busy for a few seconds, Windows swaps each window for a
+    /// "Not Responding" copy with a title bar and a white background. For the
+    /// bar that showed as a box with the window's title behind the rounded
+    /// shape. Without ghosting, the bar just stays as it is until the app answers.
+    pub fn no_ghost_frames() {
+        unsafe { DisableProcessWindowsGhosting() }
     }
 
     const SW_HIDE: i32 = 0;
@@ -122,7 +149,7 @@ mod native {
     const SWP_FLAGS: u32 = SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED;
 
     fn hwnd(w: &WebviewWindow) -> Option<*mut c_void> {
-        w.hwnd().ok().map(|h| h.0 as *mut c_void)
+        w.hwnd().ok().map(|h| h.0)
     }
 
     /// No title bar or borders, never activated, not in the taskbar.
@@ -181,6 +208,8 @@ mod native {
     use tauri::WebviewWindow;
 
     pub fn strip_frame(_w: &WebviewWindow) {}
+
+    pub fn no_ghost_frames() {}
 
     pub fn show_without_focus(w: &WebviewWindow) {
         let _ = w.show();

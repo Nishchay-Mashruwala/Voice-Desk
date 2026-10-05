@@ -198,6 +198,17 @@ on which models are kept.
 - **D3 — The 1.5 GB target.** A CPU-only PC needs ~1.6–1.9 GB with the 1.7B
   model; it can't reach 1.5 GB with a useful task model. Accept ~1.9 GB?
 
+### Decisions taken
+
+- **D1 — done:** Ollama replaced by a downloaded `llama-server` (llama.cpp).
+- **D2 — Qwen3 4B is the default on PCs with 6 GB+ RAM** (owner decision,
+  2026-10-05): accuracy over size — in tests 1.7B missed tasks the 4B found.
+  1.7B stays selectable in Settings and is used below 6 GB.
+- **First-run install uses `pip` (not `uv`)** in the downloaded Python, with
+  `-c engine/constraints.txt` so every install gets the same pinned, tested
+  package versions. (The from-source setup scripts still use `uv`, with the
+  same constraints.)
+
 ## Testing and measurement
 
 - Every phase: `cargo test`, `npm run build`, `engine/test_commands.py`, plus

@@ -7,6 +7,8 @@ interface Toast {
   onExpire?: () => void;
   /** How long it stays (ms). Undo toasts show a shrinking bar for this time. */
   duration: number;
+  /** A newer toast with the same key replaces this one in place (progress updates). */
+  key?: string;
 }
 
 type Listener = (t: Toast) => void;
@@ -17,7 +19,7 @@ let nextId = 1;
 /** Show a small notification. `onExpire` runs if the action wasn't clicked. */
 export function toast(
   message: string,
-  opts: { action?: Toast["action"]; onExpire?: () => void; duration?: number } = {},
+  opts: { action?: Toast["action"]; onExpire?: () => void; duration?: number; key?: string } = {},
 ) {
   const t = { id: nextId++, message, ...opts, duration: opts.duration ?? 4500 };
   listeners.forEach((l) => l(t));
@@ -33,7 +35,10 @@ export function ToastHost() {
 
   useEffect(() => {
     const add: Listener = (t) => {
-      setItems((prev) => [...prev.slice(-3), t]);
+      setItems((prev) => {
+        const i = t.key ? prev.findIndex((x) => x.key === t.key) : -1;
+        return i >= 0 ? prev.map((x, j) => (j === i ? t : x)) : [...prev.slice(-3), t];
+      });
       setTimeout(() => {
         if (!actioned.delete(t.id)) t.onExpire?.();
         setItems((prev) => prev.filter((x) => x.id !== t.id));
@@ -46,7 +51,7 @@ export function ToastHost() {
   }, []);
 
   return (
-    <div className="toast-stack">
+    <div className="toast-stack" role="status" aria-live="polite">
       {items.map((t) => (
         <div key={t.id} className="toast">
           <span className="grow">{t.message}</span>

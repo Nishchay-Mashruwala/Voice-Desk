@@ -1,45 +1,45 @@
 mod audio;
 mod db;
+mod downloads;
 mod engine;
+mod engine_setup;
 mod hardware;
+mod hotkey;
 mod insert;
 mod jumplist;
 mod llm;
+mod meetings;
 mod meeting_detect;
 mod overlay;
 mod pipeline;
+mod search;
+mod secrets;
 mod session;
+mod system;
+mod tasks;
+mod voice;
 
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
-use audio::{Recording, Source};
-use db::{Db, Dictation, Meeting, NewTask, Segment, Settings, Task};
+use audio::Recording;
+use db::{Db, Dictation, Settings};
 use engine::Engine;
-use llm::{Llm, LlmStatus};
+use llm::Llm;
 use session::Work;
 
-type CmdResult<T> = Result<T, String>;
+pub(crate) type CmdResult<T> = Result<T, String>;
 
-fn err(e: impl std::fmt::Display) -> String {
+pub(crate) fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
-}
-
-pub struct ActiveMeeting {
-    pub id: i64,
-    mic: Recording,
-    system: Option<Recording>,
-    pub started: Instant,
 }
 
 pub struct AppState {
@@ -53,16 +53,30 @@ pub struct AppState {
     /// Task recordings still being processed.
     pub processing: AtomicU64,
     pub work: Sender<Work>,
-    pub meeting: Mutex<Option<ActiveMeeting>>,
+    pub meeting: Mutex<Option<meetings::ActiveMeeting>>,
     /// The call going on right now (a call app using the mic), if any.
     pub call: Mutex<Option<meeting_detect::Call>>,
     /// The call the overlay is offering to transcribe.
     pub call_prompt: Mutex<Option<meeting_detect::Call>>,
     /// ✕ on the offer: don't offer this call again (picked up by the detector).
     pub call_dismiss: Mutex<Option<String>>,
+    /// Listening when the offered call started: when it becomes a meeting recording.
+    pub call_switch_at: Mutex<Option<std::time::Instant>>,
+    /// The shortcut was pressed once during a meeting (a second press stops it).
+    pub stop_armed: Mutex<Option<std::time::Instant>>,
     enroll: Mutex<Option<Recording>>,
     pub overlay_pos: Mutex<Option<(i32, i32)>>,
     engine_status: Mutex<Value>,
+    /// The engine status a model download interrupted, put back when it ends.
+    status_before_download: Mutex<Option<Value>>,
+    /// engine_install / llm_pull running (one at a time each).
+    pub installing: AtomicBool,
+    pub pulling: AtomicBool,
+    /// The last "engine-setup" progress while engine_install runs.
+    pub install_progress: Mutex<Option<system::SetupProgress>>,
+    /// The engine's last "models_in_use" answer and the settings it was for, so
+    /// Settings -> Storage doesn't wake a sleeping engine to ask again.
+    pub models_in_use: Mutex<Option<(String, Value)>>,
 }
 
 impl AppState {
@@ -87,83 +101,6 @@ pub type Shared = Arc<AppState>;
 fn set_engine_status(app: &AppHandle, st: &AppState, status: Value) {
     *st.engine_status.lock().unwrap() = status.clone();
     let _ = app.emit("engine-status", status);
-}
-
-// --------------------------------------------------------------------------- //
-// Hotkey
-// --------------------------------------------------------------------------- //
-
-/// Tracks presses for the double-press and long-press shortcut modes.
-#[derive(Default)]
-struct KeyState {
-    last_press: Option<Instant>,
-    /// Incremented on every press/release; a pending long-press only fires if unchanged.
-    generation: u64,
-}
-
-const DOUBLE_PRESS_WINDOW: Duration = Duration::from_millis(450);
-
-fn register_hotkey(app: &AppHandle, settings: &Settings) -> Result<(), String> {
-    let gs = app.global_shortcut();
-    gs.unregister_all().map_err(err)?;
-    let mode = settings.dictation_mode.clone();
-    let long_press = Duration::from_secs_f32(settings.long_press_s.clamp(0.5, 10.0));
-    let keys = Arc::new(Mutex::new(KeyState::default()));
-    gs.on_shortcut(settings.dictation_hotkey.as_str(), move |app, _shortcut, event| {
-        let st = app.state::<Shared>().inner().clone();
-        let pressed = event.state() == ShortcutState::Pressed;
-        let result = match (mode.as_str(), pressed) {
-            // Push-to-talk: listen only while the keys are held.
-            ("hold", true) => session::start(app, &st),
-            ("hold", false) => {
-                session::stop(app, &st);
-                Ok(())
-            }
-            // Double-press to start, double-press to stop.
-            ("double", true) => {
-                let mut k = keys.lock().unwrap();
-                let now = Instant::now();
-                if k.last_press.is_some_and(|t| now - t <= DOUBLE_PRESS_WINDOW) {
-                    k.last_press = None;
-                    drop(k);
-                    session::toggle(app, &st)
-                } else {
-                    k.last_press = Some(now);
-                    Ok(())
-                }
-            }
-            // Hold for N seconds to start, again to stop (hard to trigger by accident).
-            ("long", true) => {
-                let generation = {
-                    let mut k = keys.lock().unwrap();
-                    k.generation += 1;
-                    k.generation
-                };
-                let (app, keys) = (app.clone(), keys.clone());
-                std::thread::spawn(move || {
-                    std::thread::sleep(long_press);
-                    if keys.lock().unwrap().generation == generation {
-                        let st = app.state::<Shared>().inner().clone();
-                        if let Err(e) = session::toggle(&app, &st) {
-                            let _ = app.emit("session-notice", json!({ "message": e }));
-                        }
-                    }
-                });
-                Ok(())
-            }
-            ("long", false) => {
-                keys.lock().unwrap().generation += 1; // released early: cancel
-                Ok(())
-            }
-            // Default: press once to start, once to stop.
-            (_, true) => session::toggle(app, &st),
-            (_, false) => Ok(()),
-        };
-        if let Err(e) = result {
-            let _ = app.emit("session-notice", json!({ "message": e }));
-        }
-    })
-    .map_err(|e| format!("Could not register hotkey '{}': {e}", settings.dictation_hotkey))
 }
 
 /// Put the most recent dictation on the clipboard (tray menu, taskbar menu).
@@ -195,14 +132,14 @@ fn save_settings(app: AppHandle, st: State<Shared>, settings: Settings) -> CmdRe
     if !(1..=3).contains(&keys) {
         return Err("The shortcut must use 1 to 3 keys".into());
     }
-    if let Err(e) = register_hotkey(&app, &settings) {
-        let _ = register_hotkey(&app, &old); // keep the previous working hotkey
+    if let Err(e) = hotkey::register_hotkey(&app, &settings) {
+        let _ = hotkey::register_hotkey(&app, &old); // keep the previous working hotkey
         return Err(e);
     }
     st.db.save_settings(&settings).map_err(err)?;
     let _ = st.engine.start_request("configure", json!({ "unload_after_min": settings.unload_after_min }), None);
     if old.whisper_model != settings.whisper_model
-        || old.whisper_device != settings.whisper_device
+        || old.device != settings.device
         || old.langs() != settings.langs()
     {
         warm_up_engine(app.clone(), st.inner().clone());
@@ -229,9 +166,12 @@ fn session_status(st: State<Shared>) -> session::Status {
     session::status(st.inner())
 }
 
+/// Opening the microphone can take a second or more: done off the main thread
+/// (which draws the windows), in order with the shortcut's starts and stops.
 #[tauri::command]
-fn session_toggle(app: AppHandle, st: State<Shared>) -> CmdResult<()> {
-    session::toggle(&app, st.inner())
+async fn session_toggle(app: AppHandle, st: State<'_, Shared>) -> CmdResult<()> {
+    let st = st.inner().clone();
+    session::in_order_async(move || session::toggle(&app, &st)).await?
 }
 
 #[tauri::command]
@@ -244,14 +184,66 @@ fn session_set_writing(app: AppHandle, st: State<Shared>, on: bool) {
     session::set_writing(&app, st.inner(), on);
 }
 
+/// Starting a task recording opens the system audio: off the main thread too.
 #[tauri::command]
-fn capture_toggle(app: AppHandle, st: State<Shared>) -> CmdResult<()> {
-    session::toggle_capture(&app, st.inner())
+async fn capture_toggle(app: AppHandle, st: State<'_, Shared>) -> CmdResult<()> {
+    let st = st.inner().clone();
+    session::in_order_async(move || session::toggle_capture(&app, &st)).await?
 }
 
 #[tauri::command]
-fn list_dictations(st: State<Shared>) -> CmdResult<Vec<Dictation>> {
+async fn list_dictations(st: State<'_, Shared>) -> CmdResult<Vec<Dictation>> {
     st.db.dictations(200).map_err(err)
+}
+
+/// Clears the "already running" flag however setup ends.
+struct Running<'a>(&'a AtomicBool);
+
+impl<'a> Running<'a> {
+    fn start(flag: &'a AtomicBool, what: &str) -> CmdResult<Self> {
+        flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map(|_| Self(flag))
+            .map_err(|_| format!("{what} is already running"))
+    }
+}
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// First run: download Python, the speech engine's packages (plus the chosen
+/// packs) and its models. Progress goes out as "engine-setup" events.
+#[tauri::command]
+async fn engine_install(app: AppHandle, st: State<'_, Shared>, packs: engine_setup::Packs) -> CmdResult<()> {
+    let _running = Running::start(&st.installing, "Setup")?;
+    let engine_dir = st.engine.script_dir();
+    let http = downloads::client();
+    let (app2, st2) = (app.clone(), st.inner().clone());
+    let result = engine_setup::install(&http, &engine_dir, packs, move |step, pct, detail| {
+        let p = system::SetupProgress { step: step.into(), pct, detail: detail.into() };
+        let _ = app2.emit("engine-setup", &p);
+        *st2.install_progress.lock().unwrap() = Some(p);
+    })
+    .await;
+    *st.install_progress.lock().unwrap() = None;
+    result.map_err(err)?;
+    warm_up_engine(app, st.inner().clone());
+    Ok(())
+}
+
+/// Search recordings, meetings and tasks.
+#[tauri::command]
+async fn search_all(st: State<'_, Shared>, query: String) -> CmdResult<Vec<search::Hit>> {
+    let st = st.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || search::search(&st.db, &query)).await.map_err(err)?.map_err(err)
+}
+
+/// Fix a Listen recording's text (misheard words). `words`: re-timed words for playback.
+#[tauri::command]
+fn update_dictation_text(st: State<Shared>, id: i64, text: String, words: Value) -> CmdResult<()> {
+    st.db.update_dictation_text(id, text.trim(), &words).map_err(err)
 }
 
 #[tauri::command]
@@ -262,11 +254,15 @@ fn delete_dictation(st: State<Shared>, id: i64) -> CmdResult<()> {
     Ok(())
 }
 
-/// The recording of a listening session, as WAV bytes for the History player.
+/// The recording of a listening session, as bytes for the History player
+/// (read off the main thread: an hour is ~100 MB as WAV).
 #[tauri::command]
-fn dictation_audio(st: State<Shared>, id: i64) -> CmdResult<tauri::ipc::Response> {
+async fn dictation_audio(st: State<'_, Shared>, id: i64) -> CmdResult<tauri::ipc::Response> {
     let path = st.db.dictation_audio_path(id).map_err(err)?.ok_or("This entry has no recording")?;
-    let bytes = std::fs::read(&path).map_err(|e| format!("Recording not found: {e}"))?;
+    let bytes = tauri::async_runtime::spawn_blocking(move || std::fs::read(&path))
+        .await
+        .map_err(err)?
+        .map_err(|e| format!("Recording not found: {e}"))?;
     Ok(tauri::ipc::Response::new(bytes))
 }
 
@@ -278,546 +274,32 @@ struct Levels {
     enroll: Option<f32>,
 }
 
+/// Polled by the meters many times a second on the main thread: never waits for
+/// a lock (one that's busy, e.g. while a device opens, reads as no level).
 #[tauri::command]
 fn audio_levels(st: State<Shared>) -> Levels {
-    let listening = st.session.lock().unwrap().as_ref().and_then(|s| s.mic_level());
-    let enroll = st.enroll.lock().unwrap().as_ref().map(|r| r.level());
-    let m = st.meeting.lock().unwrap();
-    Levels {
-        listening,
-        mic: m.as_ref().map(|m| m.mic.level()),
-        system: m.as_ref().and_then(|m| m.system.as_ref().map(|s| s.level())),
-        enroll,
-    }
-}
-
-// --------------------------------------------------------------------------- //
-// Commands: meetings
-// --------------------------------------------------------------------------- //
-
-#[derive(Serialize)]
-struct StartedMeeting {
-    id: i64,
-    system_audio: bool,
-    warning: Option<String>,
-}
-
-#[tauri::command]
-fn start_meeting(app: AppHandle, st: State<Shared>, title: String) -> CmdResult<StartedMeeting> {
-    begin_meeting(&app, st.inner(), &title)
-}
-
-/// Start recording a meeting: the mic (you) and the speakers (everyone else).
-pub(crate) fn begin_meeting(app: &AppHandle, st: &Shared, title: &str) -> CmdResult<StartedMeeting> {
-    let started = begin_meeting_inner(app, st, title);
-    *st.call_prompt.lock().unwrap() = None;
-    session::emit_status(app, st);
-    started
-}
-
-fn begin_meeting_inner(app: &AppHandle, st: &Shared, title: &str) -> CmdResult<StartedMeeting> {
-    let mut slot = st.meeting.lock().unwrap();
-    if slot.is_some() {
-        return Err("A meeting is already being recorded".into());
-    }
-    let title = if title.trim().is_empty() {
-        format!("Meeting {}", chrono::Local::now().format("%b %d, %H:%M"))
-    } else {
-        title.trim().to_string()
+    let listening = st.session.try_lock().ok().and_then(|g| g.as_ref().and_then(|s| s.mic_level()));
+    let enroll = st.enroll.try_lock().ok().and_then(|g| g.as_ref().map(|r| r.level()));
+    let (mic, system) = match st.meeting.try_lock() {
+        Ok(m) => (m.as_ref().map(|m| m.mic.level()), m.as_ref().and_then(|m| m.system.as_ref().map(|s| s.level()))),
+        Err(_) => (None, None),
     };
-    let id = st.db.create_meeting(&title, "meeting").map_err(err)?;
-    let (mic_path, sys_path) = st.meeting_paths(id);
-
-    let mic = match Recording::to_file(Source::Microphone, &mic_path) {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = st.db.set_meeting_status(id, "error", Some(&e.to_string()));
-            let _ = app.emit("meetings-changed", ());
-            return Err(format!("Microphone error: {e}"));
-        }
-    };
-    let (system, warning) = match Recording::to_file(Source::System, &sys_path) {
-        Ok(r) => (Some(r), None),
-        Err(e) => (None, Some(format!("System audio unavailable, recording microphone only: {e}"))),
-    };
-    let system_audio = system.is_some();
-    *slot = Some(ActiveMeeting { id, mic, system, started: Instant::now() });
-    let _ = app.emit("meetings-changed", ());
-    Ok(StartedMeeting { id, system_audio, warning })
-}
-
-#[tauri::command]
-async fn stop_meeting(app: AppHandle, st: State<'_, Shared>) -> CmdResult<i64> {
-    end_meeting(&app, st.inner()).await
-}
-
-/// Stop recording the meeting, then transcribe it and find tasks in the background.
-pub(crate) async fn end_meeting(app: &AppHandle, st: &Shared) -> CmdResult<i64> {
-    let active = st.meeting.lock().unwrap().take().ok_or("No meeting is being recorded")?;
-    session::emit_status(app, st);
-    let _ = app.emit("meetings-changed", ());
-    let id = active.id;
-    tauri::async_runtime::spawn_blocking(move || {
-        active.mic.stop()?;
-        if let Some(s) = active.system {
-            s.stop()?;
-        }
-        anyhow::Ok(())
-    })
-    .await
-    .map_err(err)?
-    .map_err(err)?;
-    let (app, st) = (app.clone(), st.clone());
-    tauri::async_runtime::spawn(async move {
-        let _ = pipeline::process(app, st, id, pipeline::Input::Recording).await;
-    });
-    Ok(id)
-}
-
-#[tauri::command]
-fn active_meeting(st: State<Shared>) -> Option<Value> {
-    st.meeting.lock().unwrap().as_ref().map(|m| json!({ "id": m.id, "elapsed_s": m.started.elapsed().as_secs_f64() }))
-}
-
-/// "Transcribe Meeting" on the overlay's call offer.
-#[tauri::command]
-fn call_prompt_accept(app: AppHandle, st: State<Shared>) -> CmdResult<()> {
-    accept_call(&app, st.inner())
-}
-
-/// Record the call the overlay is offering (its button, or the shortcut).
-pub(crate) fn accept_call(app: &AppHandle, st: &Shared) -> CmdResult<()> {
-    let call = st.call_prompt.lock().unwrap().clone().ok_or("The call has ended")?;
-    // A meeting recording takes over from dictation.
-    session::stop(app, st);
-    let title = format!("{} call · {}", call.app, chrono::Local::now().format("%b %d, %H:%M"));
-    let started = begin_meeting(app, st, &title)?;
-    let message = started.warning.unwrap_or_else(|| format!("Recording the {} call", call.app));
-    let _ = app.emit("session-notice", json!({ "message": message, "short": "● Recording" }));
-    Ok(())
-}
-
-/// ✕ on the call offer: not for this call.
-#[tauri::command]
-fn call_prompt_dismiss(app: AppHandle, st: State<Shared>) {
-    if let Some(call) = st.call_prompt.lock().unwrap().take() {
-        *st.call_dismiss.lock().unwrap() = Some(call.key);
-    }
-    session::emit_status(&app, st.inner());
-}
-
-#[tauri::command]
-async fn hardware_info() -> hardware::Hardware {
-    tauri::async_runtime::spawn_blocking(hardware::info).await.expect("hardware info")
-}
-
-#[tauri::command]
-async fn resource_usage() -> hardware::Usage {
-    tauri::async_runtime::spawn_blocking(hardware::usage).await.expect("resource usage")
-}
-
-#[tauri::command]
-fn watched_call_apps() -> &'static str {
-    meeting_detect::WATCHED
-}
-
-/// Re-run the pipeline. `transcribe = false` only re-extracts tasks (e.g. after changing your name).
-#[tauri::command]
-fn reprocess_meeting(app: AppHandle, st: State<Shared>, id: i64, transcribe: bool) -> CmdResult<()> {
-    let input = if transcribe {
-        let (mic, sys) = st.meeting_paths(id);
-        if !mic.exists() && !sys.exists() {
-            return Err("The audio for this recording is no longer available".into());
-        }
-        pipeline::Input::Recording
-    } else {
-        pipeline::Input::Reextract
-    };
-    let st = st.inner().clone();
-    tauri::async_runtime::spawn(async move {
-        let _ = pipeline::process(app, st, id, input).await;
-    });
-    Ok(())
-}
-
-/// One of a meeting's two recordings: "mic" (you) or "system" (the computer's audio).
-#[tauri::command]
-fn meeting_audio(st: State<Shared>, id: i64, track: String) -> CmdResult<tauri::ipc::Response> {
-    let (mic, system) = st.meeting_paths(id);
-    let path = if track == "system" { system } else { mic };
-    let bytes = std::fs::read(&path).map_err(|_| "This recording is not available".to_string())?;
-    Ok(tauri::ipc::Response::new(bytes))
-}
-
-#[derive(Serialize)]
-struct MeetingTracks {
-    mic: bool,
-    system: bool,
-}
-
-#[tauri::command]
-fn meeting_tracks(st: State<Shared>, id: i64) -> MeetingTracks {
-    let (mic, system) = st.meeting_paths(id);
-    MeetingTracks { mic: mic.exists(), system: system.exists() }
-}
-
-/// Find tasks in a Listen recording. The tasks are grouped under a hidden
-/// "dictation" entry so they show where they came from on the Tasks page.
-#[tauri::command]
-async fn dictation_find_tasks(app: AppHandle, st: State<'_, Shared>, id: i64) -> CmdResult<usize> {
-    let d = st
-        .db
-        .dictations(10_000)
-        .map_err(err)?
-        .into_iter()
-        .find(|d| d.id == id)
-        .ok_or("Recording not found")?;
-    let when = chrono::DateTime::parse_from_rfc3339(&d.created_at)
-        .map(|t| t.format("%b %d, %H:%M").to_string())
-        .unwrap_or_default();
-    // Tasks already found: don't add the same ones again. If they were all
-    // deleted, look again into the same meeting rather than a new one.
-    if !d.tasks.is_empty() {
-        return Ok(d.tasks.len());
-    }
-    let meeting_id = match d.meeting_id {
-        Some(m) => m,
-        None => {
-            let m = st.db.create_meeting(&format!("Recording · {when}"), "dictation").map_err(err)?;
-            st.db.set_dictation_meeting(id, m).map_err(err)?;
-            m
-        }
-    };
-    let duration = d.duration_ms as f64 / 1000.0;
-    let words = serde_json::from_value(d.words).ok();
-    let segment = Segment { start: 0.0, end: duration, speaker: "Me".into(), text: d.text, words };
-    st.db.save_transcript(meeting_id, &[segment], duration).map_err(err)?;
-    pipeline::process(app, st.inner().clone(), meeting_id, pipeline::Input::Reextract).await
-}
-
-/// "Make it a meeting": re-transcribe a Listen recording with speaker detection.
-#[tauri::command]
-fn dictation_to_meeting(app: AppHandle, st: State<Shared>, id: i64) -> CmdResult<i64> {
-    let d = st.db.dictations(10_000).map_err(err)?.into_iter().find(|d| d.id == id).ok_or("Recording not found")?;
-    if !d.has_audio {
-        return Err("This recording's audio was already deleted, so it can't be transcribed again".into());
-    }
-    let when = chrono::DateTime::parse_from_rfc3339(&d.created_at)
-        .map(|t| t.format("%b %d, %H:%M").to_string())
-        .unwrap_or_default();
-    let (meeting_id, audio) = st.db.dictation_into_meeting(id, &format!("Meeting · {when}")).map_err(err)?;
-    let (mic, sys) = st.meeting_paths(meeting_id);
-    let _ = std::fs::remove_file(&sys);
-    if let Some(audio) = audio {
-        if std::fs::rename(&audio, &mic).is_err() {
-            std::fs::copy(&audio, &mic).map_err(|e| format!("Couldn't move the recording: {e}"))?;
-            let _ = std::fs::remove_file(&audio);
-        }
-    }
-    let _ = app.emit("meetings-changed", ());
-    let _ = app.emit("tasks-changed", ());
-    let st2 = st.inner().clone();
-    tauri::async_runtime::spawn(async move {
-        let _ = pipeline::process(app, st2, meeting_id, pipeline::Input::Recording).await;
-    });
-    Ok(meeting_id)
-}
-
-/// "Move to Listen history": one recording (both tracks mixed), words from the transcript.
-#[tauri::command]
-fn meeting_to_dictation(app: AppHandle, st: State<Shared>, id: i64) -> CmdResult<Dictation> {
-    let m = st.db.meeting(id).map_err(err)?.ok_or("Meeting not found")?;
-    if !matches!(m.status.as_str(), "done" | "error") {
-        return Err("Wait until the meeting has finished processing".into());
-    }
-    let segments = st.db.transcript(id).map_err(err)?;
-    let mut words: Vec<Value> = Vec::new();
-    for s in &segments {
-        match &s.words {
-            Some(ws) if !ws.is_empty() => words.extend(ws.iter().map(|w| json!({ "w": w.w, "s": w.s, "e": w.e }))),
-            // Older transcripts: spread the line's time over its words.
-            _ => {
-                let parts: Vec<&str> = s.text.split_whitespace().collect();
-                let total: usize = parts.iter().map(|p| p.chars().count() + 1).sum::<usize>().max(1);
-                let mut t = s.start;
-                for p in parts {
-                    let d = (s.end - s.start) * (p.chars().count() + 1) as f64 / total as f64;
-                    words.push(json!({ "w": p, "s": t, "e": t + d }));
-                    t += d;
-                }
-            }
-        }
-    }
-    let text = segments.iter().map(|s| s.text.trim()).collect::<Vec<_>>().join(" ");
-
-    let (mic, sys) = st.meeting_paths(id);
-    let tracks: Vec<&std::path::Path> = [mic.as_path(), sys.as_path()].into_iter().filter(|p| p.exists()).collect();
-    let audio = if tracks.is_empty() {
-        None
-    } else {
-        let out = st
-            .recordings_dir()
-            .join(format!("listen-{}-m{id}.wav", chrono::Local::now().format("%Y%m%d-%H%M%S")));
-        audio::mix_wavs(&tracks, &out).map_err(err)?;
-        Some(out)
-    };
-    let duration_ms = (m.duration_s.unwrap_or(0.0) * 1000.0) as i64;
-    let did = match st.db.meeting_into_dictation(id, &text, duration_ms, audio.as_deref(), &Value::Array(words)) {
-        Ok(did) => did,
-        Err(e) => {
-            if let Some(a) = &audio {
-                let _ = std::fs::remove_file(a);
-            }
-            return Err(err(e));
-        }
-    };
-    for t in tracks {
-        let _ = std::fs::remove_file(t);
-    }
-    let d = st.db.dictations(10_000).map_err(err)?.into_iter().find(|d| d.id == did).ok_or("Recording not found")?;
-    let _ = app.emit("meetings-changed", ());
-    let _ = app.emit("tasks-changed", ());
-    Ok(d)
-}
-
-#[tauri::command]
-fn list_meetings(st: State<Shared>) -> CmdResult<Vec<Meeting>> {
-    st.db.meetings().map_err(err)
-}
-
-#[tauri::command]
-fn get_transcript(st: State<Shared>, id: i64) -> CmdResult<Vec<Segment>> {
-    st.db.transcript(id).map_err(err)
-}
-
-#[tauri::command]
-fn rename_meeting(st: State<Shared>, id: i64, title: String) -> CmdResult<()> {
-    st.db.rename_meeting(id, &title).map_err(err)
-}
-
-#[tauri::command]
-fn delete_meeting(app: AppHandle, st: State<Shared>, id: i64) -> CmdResult<()> {
-    if st.meeting.lock().unwrap().as_ref().map(|m| m.id) == Some(id) {
-        return Err("Stop the recording first".into());
-    }
-    let (mic, sys) = st.meeting_paths(id);
-    let _ = std::fs::remove_file(mic);
-    let _ = std::fs::remove_file(sys);
-    st.db.delete_meeting(id).map_err(err)?;
-    // Its tasks went with it.
-    let _ = app.emit("tasks-changed", ());
-    Ok(())
-}
-
-// --------------------------------------------------------------------------- //
-// Commands: tasks
-// --------------------------------------------------------------------------- //
-
-#[tauri::command]
-fn list_tasks(st: State<Shared>, meeting_id: Option<i64>) -> CmdResult<Vec<Task>> {
-    st.db.tasks(meeting_id).map_err(err)
-}
-
-#[tauri::command]
-fn set_task_done(st: State<Shared>, id: i64, done: bool) -> CmdResult<()> {
-    st.db.set_task_done(id, done).map_err(err)
-}
-
-#[tauri::command]
-fn update_task(app: AppHandle, st: State<Shared>, id: i64, description: String, due: Option<String>) -> CmdResult<()> {
-    let due = due.filter(|d| !d.trim().is_empty());
-    st.db.update_task(id, description.trim(), due.as_deref()).map_err(err)?;
-    let _ = app.emit("tasks-changed", ());
-    Ok(())
-}
-
-#[tauri::command]
-fn add_task(st: State<Shared>, meeting_id: Option<i64>, description: String, due: Option<String>) -> CmdResult<()> {
-    st.db
-        .add_task(meeting_id, &NewTask { description, assigned_by: Some("Self".into()), due, quote: None })
-        .map_err(err)
-}
-
-#[tauri::command]
-fn delete_task(app: AppHandle, st: State<Shared>, id: i64) -> CmdResult<()> {
-    st.db.delete_task(id).map_err(err)?;
-    let _ = app.emit("tasks-changed", ());
-    Ok(())
-}
-
-#[tauri::command]
-fn reorder_tasks(app: AppHandle, st: State<Shared>, ids: Vec<i64>) -> CmdResult<()> {
-    st.db.reorder_tasks(&ids).map_err(err)?;
-    let _ = app.emit("tasks-changed", ());
-    Ok(())
-}
-
-// --------------------------------------------------------------------------- //
-// Commands: voice profile
-// --------------------------------------------------------------------------- //
-
-#[derive(Serialize)]
-struct VoiceProfile {
-    exists: bool,
-    created_at: Option<String>,
-}
-
-#[tauri::command]
-fn voice_profile_info(st: State<Shared>) -> VoiceProfile {
-    let path = st.voice_profile_path();
-    let created_at = std::fs::metadata(&path)
-        .and_then(|m| m.modified())
-        .ok()
-        .map(|t| chrono::DateTime::<chrono::Local>::from(t).to_rfc3339());
-    VoiceProfile { exists: path.exists(), created_at }
-}
-
-#[tauri::command]
-fn enroll_start(st: State<Shared>) -> CmdResult<()> {
-    let mut slot = st.enroll.lock().unwrap();
-    if slot.is_none() {
-        let path = st.data_dir.join("voice_enroll.wav");
-        *slot = Some(Recording::to_file(Source::Microphone, &path).map_err(|e| format!("Microphone error: {e}"))?);
-    }
-    Ok(())
-}
-
-#[tauri::command]
-async fn enroll_stop(app: AppHandle, st: State<'_, Shared>, save: bool) -> CmdResult<Value> {
-    let rec = st.enroll.lock().unwrap().take().ok_or("Not recording")?;
-    tauri::async_runtime::spawn_blocking(move || rec.stop()).await.map_err(err)?.map_err(err)?;
-    let wav = st.data_dir.join("voice_enroll.wav");
-    if !save {
-        let _ = std::fs::remove_file(&wav);
-        return Ok(Value::Null);
-    }
-    let profile = st.voice_profile_path();
-    let res = st.engine.request("enroll", json!({ "path": wav, "out": profile }), None).await;
-    let _ = std::fs::remove_file(&wav);
-    let res = res.map_err(err)?;
-    if let Some(sid) = st.session.lock().unwrap().as_ref().map(|s| s.sid) {
-        let _ = st.engine.start_request("stream_update", json!({ "sid": sid, "voice_profile": profile }), None);
-    }
-    session::emit_status(&app, st.inner());
-    Ok(res)
-}
-
-#[tauri::command]
-fn delete_voice_profile(st: State<Shared>) -> CmdResult<()> {
-    let path = st.voice_profile_path();
-    if path.exists() {
-        std::fs::remove_file(&path).map_err(err)?;
-    }
-    if let Some(sid) = st.session.lock().unwrap().as_ref().map(|s| s.sid) {
-        let _ = st.engine.start_request("stream_update", json!({ "sid": sid, "voice_profile": null }), None);
-    }
-    Ok(())
-}
-
-// --------------------------------------------------------------------------- //
-// Commands: setup & engine
-// --------------------------------------------------------------------------- //
-
-#[derive(Serialize)]
-struct SetupStatus {
-    engine_installed: bool,
-    engine: Value,
-    name_set: bool,
-    hf_token_set: bool,
-    voice_profile: bool,
-    llm: LlmStatus,
-}
-
-#[tauri::command]
-async fn setup_status(st: State<'_, Shared>) -> CmdResult<SetupStatus> {
-    let s = st.db.settings().map_err(err)?;
-    let engine = st.engine_status.lock().unwrap().clone();
-    Ok(SetupStatus {
-        engine_installed: st.engine.is_installed(),
-        engine,
-        name_set: !s.user_name.trim().is_empty(),
-        hf_token_set: !s.hf_token.trim().is_empty(),
-        voice_profile: st.voice_profile_path().exists(),
-        llm: st.llm.status(&s).await,
-    })
-}
-
-#[tauri::command]
-async fn llm_pull(app: AppHandle, st: State<'_, Shared>) -> CmdResult<()> {
-    let s = st.db.settings().map_err(err)?;
-    let mut last = -10.0;
-    st.llm
-        .pull(&s, |status, pct| {
-            // Throttle UI updates to whole-percent steps.
-            if pct < 0.0 || pct - last >= 1.0 || pct >= 100.0 {
-                last = pct;
-                let _ = app.emit("llm-pull", json!({ "status": status, "pct": pct }));
-            }
-        })
-        .await
-        .map_err(err)
-}
-
-#[derive(Serialize)]
-struct DataPaths {
-    app_data: PathBuf,
-    database: PathBuf,
-    recordings: PathBuf,
-    voice_profile: PathBuf,
-    speech_models: PathBuf,
-    llm_models: PathBuf,
-}
-
-fn home_dir() -> PathBuf {
-    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from).unwrap_or_default()
-}
-
-#[tauri::command]
-fn data_paths(st: State<Shared>) -> DataPaths {
-    let hf = std::env::var_os("HF_HOME")
-        .map(|h| PathBuf::from(h).join("hub"))
-        .unwrap_or_else(|| home_dir().join(".cache").join("huggingface").join("hub"));
-    let ollama = std::env::var_os("OLLAMA_MODELS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".ollama").join("models"));
-    DataPaths {
-        app_data: st.data_dir.clone(),
-        database: st.data_dir.join("voicedesk.db"),
-        recordings: st.recordings_dir.clone(),
-        voice_profile: st.voice_profile_path(),
-        speech_models: hf,
-        llm_models: ollama,
-    }
-}
-
-#[tauri::command]
-fn open_folder(app: AppHandle, path: String) -> CmdResult<()> {
-    use tauri_plugin_opener::OpenerExt;
-    app.opener().open_path(path, None::<&str>).map_err(err)
-}
-
-#[tauri::command]
-fn overlay_resize(app: AppHandle, width: f64, height: f64) {
-    overlay::resize(&app, width, height);
-}
-
-#[tauri::command]
-fn engine_state(st: State<Shared>) -> Value {
-    st.engine_status.lock().unwrap().clone()
-}
-
-#[tauri::command]
-fn engine_restart(app: AppHandle, st: State<Shared>) {
-    st.engine.shutdown();
-    warm_up_engine(app, st.inner().clone());
+    Levels { listening, mic, system, enroll }
 }
 
 // --------------------------------------------------------------------------- //
 // Setup
 // --------------------------------------------------------------------------- //
 
-/// Dev default: the project's .venv and engine/ folder. Override with env vars.
-fn engine_paths() -> (PathBuf, PathBuf) {
+/// The speech engine: Python + engine/engine.py.
+/// - Development (`tauri dev`, a debug build): the project's `.venv` and
+///   `engine/` (when they exist).
+/// - Release builds, always: Python set up on first run (engine_setup.rs) and
+///   the engine files that ship with the app. Even on the computer that built
+///   it, so testing the installer there is what a friend gets.
+///
+/// VOICEDESK_PYTHON / VOICEDESK_ENGINE override either.
+fn engine_paths(resources: Option<PathBuf>) -> (PathBuf, PathBuf) {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
     // venv layout differs: Scripts\python.exe on Windows, bin/python on macOS/Linux.
     let venv_python = if cfg!(windows) {
@@ -825,14 +307,25 @@ fn engine_paths() -> (PathBuf, PathBuf) {
     } else {
         root.join(".venv").join("bin").join("python")
     };
-    let python = std::env::var_os("VOICEDESK_PYTHON").map(PathBuf::from).unwrap_or(venv_python);
-    let script = std::env::var_os("VOICEDESK_ENGINE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| root.join("engine").join("engine.py"));
+    let dev = cfg!(debug_assertions) && venv_python.exists() && root.join("engine").join("engine.py").exists();
+    let python = std::env::var_os("VOICEDESK_PYTHON").map(PathBuf::from).unwrap_or_else(|| {
+        if dev {
+            venv_python
+        } else {
+            engine_setup::python_exe()
+        }
+    });
+    let script = std::env::var_os("VOICEDESK_ENGINE").map(PathBuf::from).unwrap_or_else(|| {
+        let bundled = resources.map(|r| r.join("engine").join("engine.py"));
+        match bundled {
+            Some(b) if !dev && b.exists() => b,
+            _ => root.join("engine").join("engine.py"),
+        }
+    });
     (python, script)
 }
 
-fn warm_up_engine(app: AppHandle, st: Shared) {
+pub(crate) fn warm_up_engine(app: AppHandle, st: Shared) {
     tauri::async_runtime::spawn(async move {
         if !st.engine.is_installed() {
             set_engine_status(
@@ -845,14 +338,10 @@ fn warm_up_engine(app: AppHandle, st: Shared) {
         set_engine_status(&app, &st, json!({ "state": "loading" }));
         let s = st.db.settings().unwrap_or_default();
         let _ = st.engine.request("configure", json!({ "unload_after_min": s.unload_after_min }), None).await;
-        let res = st
-            .engine
-            .request(
-                "load",
-                json!({ "model": s.whisper_model, "device": s.whisper_device, "languages": s.langs() }),
-                None,
-            )
-            .await;
+        // The same options as listening and meetings, so the first one doesn't load Whisper again.
+        let mut args = json!({ "model": s.whisper_model, "device": s.device });
+        session::merge_json(&mut args, s.language_options());
+        let res = st.engine.request("load", args, None).await;
         let payload = match res {
             Ok(v) => json!({ "state": "ready", "device": v["device"], "model": v["model"] }),
             Err(e) => json!({ "state": "error", "message": e.to_string() }),
@@ -868,7 +357,7 @@ fn warm_up_engine(app: AppHandle, st: Shared) {
 fn create_windows(app: &tauri::App, settings: &Settings) -> tauri::Result<()> {
     #[allow(unused_mut)]
     let mut args = String::from("--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection");
-    if settings.whisper_device == "cpu" {
+    if settings.device == "cpu" {
         args.push_str(" --disable-gpu --disable-gpu-compositing");
     }
     for cfg in app.config().app.windows.clone() {
@@ -878,6 +367,36 @@ fn create_windows(app: &tauri::App, settings: &Settings) -> tauri::Result<()> {
         builder.build()?;
     }
     Ok(())
+}
+
+/// Recordings from before compression existed (and any left by a crash): turn
+/// them into FLAC once, in the background, and update history entries.
+fn compress_old_recordings(st: Shared) {
+    let wavs: Vec<PathBuf> = std::fs::read_dir(st.recordings_dir())
+        .map(|d| d.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "wav")).collect())
+        .unwrap_or_default();
+    if wavs.is_empty() {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        // Never touch a file that's being recorded right now.
+        let busy: Vec<PathBuf> = {
+            let mut b = Vec::new();
+            if let Some(m) = st.meeting.lock().unwrap().as_ref() {
+                let (mic, sys) = st.meeting_paths(m.id);
+                b.extend([mic, sys]);
+            }
+            b
+        };
+        let todo: Vec<&PathBuf> = wavs.iter().filter(|p| !busy.contains(p)).collect();
+        if let Ok(r) = st.engine.request("compress", json!({ "paths": todo }), None).await {
+            for (from, to) in r["done"].as_object().into_iter().flatten() {
+                if let Some(to) = to.as_str() {
+                    let _ = st.db.rename_dictation_audio(from, to);
+                }
+            }
+        }
+    });
 }
 
 /// Route engine messages that aren't replies (live results, lifecycle).
@@ -896,6 +415,7 @@ fn on_engine_event(app: &AppHandle, ev: &Value) {
             let msg = ev["message"].as_str().unwrap_or("unknown error").to_string();
             let _ = st.work.send(Work::Failed(sid, msg));
         }
+        Some("download") => on_model_download(app, &st, ev),
         Some("sleeping") => set_engine_status(app, &st, json!({ "state": "sleeping" })),
         Some("exited") => {
             if st.engine_status.lock().unwrap()["state"] != "sleeping" {
@@ -909,11 +429,50 @@ fn on_engine_event(app: &AppHandle, ev: &Value) {
     }
 }
 
-/// Everything Voice Desk started stops with it: speech engine, Ollama, recordings.
+/// The engine is downloading a model (first use of a Whisper size, the
+/// Hindi/Gujarati model...): passed on as "model-download", and shown as the
+/// engine's status until it's done.
+fn on_model_download(app: &AppHandle, st: &AppState, ev: &Value) {
+    let _ = app.emit("model-download", ev);
+    let what = ev["what"].as_str().unwrap_or("a model");
+    let done = ev["done_mb"].as_f64().unwrap_or(0.0);
+    let total = ev["total_mb"].as_f64().filter(|t| *t > 0.0);
+    if total.is_some_and(|t| done >= t) {
+        // Finished: back to what it was (the engine's next ready/loading event follows).
+        let before = st.status_before_download.lock().unwrap().take();
+        if let Some(before) = before {
+            set_engine_status(app, st, before);
+        }
+        return;
+    }
+    let message = match total {
+        Some(t) => format!("Downloading {what}… {:.0}%", done / t * 100.0),
+        None => format!("Downloading {what}… {done:.0} MB"),
+    };
+    let current = st.engine_status.lock().unwrap().clone();
+    if current["message"] == message.as_str() {
+        return; // only whole-percent (or MB) changes go out
+    }
+    if current["state"] != "downloading" {
+        *st.status_before_download.lock().unwrap() = Some(current);
+    }
+    set_engine_status(app, st, json!({ "state": "downloading", "message": message }));
+}
+
+/// Everything Voice Desk started stops with it: speech engine, task AI, recordings.
+/// Recordings are finished right here (a WAV's header is written when it ends),
+/// since the app exits as soon as this returns; that takes ~0.1 s per recording.
 fn shutdown_services(app: &AppHandle) {
     let st = app.state::<Shared>();
     overlay::save(st.inner());
-    session::stop(app, st.inner());
+    if let Some(m) = st.meeting.lock().unwrap().take() {
+        let id = m.id;
+        let (mic, sys) = st.meeting_paths(id);
+        let _ = m.finish(&mic, &sys);
+        // Kept as it was recorded; Reprocess on the Meetings page transcribes it.
+        let _ = st.db.set_meeting_status(id, "error", Some("Voice Desk was closed during the recording. Use Reprocess to transcribe it."));
+    }
+    session::close(app, st.inner());
     st.engine.shutdown();
     st.llm.shutdown();
 }
@@ -939,6 +498,8 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
@@ -946,19 +507,29 @@ pub fn run() {
             std::fs::create_dir_all(&recordings_dir)?;
             let db = Db::open(&data_dir.join("voicedesk.db"))?;
             let settings = db.settings()?;
+            // Moves a token saved before the credential store was used out of the database.
+            let _ = db.save_settings(&settings);
             create_windows(app, &settings)?;
             if settings.keep_audio_days > 0 {
                 for old in db.expire_dictation_audio(settings.keep_audio_days).unwrap_or_default() {
-                    let _ = std::fs::remove_file(old);
+                    audio::remove_recording(std::path::Path::new(&old));
+                }
+                // Meetings keep their transcript, summary and tasks; only the audio goes.
+                for id in db.meetings_older_than(settings.keep_audio_days).unwrap_or_default() {
+                    for track in ["mic", "system"] {
+                        audio::remove_recording(&recordings_dir.join(format!("meeting-{id}-{track}.wav")));
+                    }
                 }
             }
-            let (python, script) = engine_paths();
+            let resources = app.path().resource_dir().ok();
+            let redist = resources.as_ref().map(|r| r.join("redist"));
+            let (python, script) = engine_paths(resources);
             let (work_tx, work_rx) = std::sync::mpsc::channel();
 
             let state: Shared = Arc::new(AppState {
                 db,
                 engine: Arc::new(Engine::new(python, script)),
-                llm: Llm::new(),
+                llm: Llm::new(redist),
                 data_dir,
                 recordings_dir,
                 session: Mutex::new(None),
@@ -969,9 +540,16 @@ pub fn run() {
                 call: Mutex::new(None),
                 call_prompt: Mutex::new(None),
                 call_dismiss: Mutex::new(None),
+                call_switch_at: Mutex::new(None),
+                stop_armed: Mutex::new(None),
                 enroll: Mutex::new(None),
                 overlay_pos: Mutex::new(None),
                 engine_status: Mutex::new(json!({ "state": "loading" })),
+                status_before_download: Mutex::new(None),
+                installing: AtomicBool::new(false),
+                pulling: AtomicBool::new(false),
+                install_progress: Mutex::new(None),
+                models_in_use: Mutex::new(None),
             });
             app.manage(state.clone());
 
@@ -983,7 +561,7 @@ pub fn run() {
                 .spawn(move || session::worker(handle, st, work_rx))?;
             meeting_detect::watch(app.handle().clone(), state.clone());
 
-            if let Err(e) = register_hotkey(app.handle(), &settings) {
+            if let Err(e) = hotkey::register_hotkey(app.handle(), &settings) {
                 eprintln!("{e}");
             }
             if let Err(e) = jumplist::install() {
@@ -994,13 +572,9 @@ pub fn run() {
             }
             overlay::init(app.handle());
             warm_up_engine(app.handle().clone(), state.clone());
-            // Start Ollama now so the first task extraction doesn't wait for it.
-            tauri::async_runtime::spawn(async move {
-                let s = state.db.settings().unwrap_or_default();
-                if let Err(e) = state.llm.ensure_running(&s).await {
-                    eprintln!("[ollama] {e}");
-                }
-            });
+            compress_old_recordings(state.clone());
+            // The task AI starts only while finding tasks (and stops a minute later).
+            drop(state);
 
             // Tray menu: listen, copy last dictation, open, quit.
             let listen = MenuItem::with_id(app, "listen", "Start / stop listening", true, None::<&str>)?;
@@ -1015,8 +589,12 @@ pub fn run() {
                 .menu(&menu)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "listen" => {
-                        let st = app.state::<Shared>().inner().clone();
-                        let _ = session::toggle(app, &st);
+                        let (app, st) = (app.clone(), app.state::<Shared>().inner().clone());
+                        session::in_order(move || {
+                            if let Err(e) = session::toggle(&app, &st) {
+                                let _ = app.emit("session-notice", json!({ "message": e }));
+                            }
+                        });
                     }
                     "copy_last" => copy_last_dictation(app),
                     "show" => {
@@ -1060,42 +638,49 @@ pub fn run() {
             list_dictations,
             delete_dictation,
             dictation_audio,
-            data_paths,
-            open_folder,
+            system::data_paths,
+            system::open_folder,
             audio_levels,
-            start_meeting,
-            stop_meeting,
-            active_meeting,
-            reprocess_meeting,
-            list_meetings,
-            get_transcript,
-            meeting_audio,
-            meeting_tracks,
-            dictation_find_tasks,
-            rename_meeting,
-            delete_meeting,
-            call_prompt_accept,
-            call_prompt_dismiss,
-            watched_call_apps,
-            hardware_info,
-            resource_usage,
-            dictation_to_meeting,
-            meeting_to_dictation,
-            list_tasks,
-            set_task_done,
-            update_task,
-            add_task,
-            delete_task,
-            reorder_tasks,
-            voice_profile_info,
-            enroll_start,
-            enroll_stop,
-            delete_voice_profile,
-            setup_status,
-            llm_pull,
-            engine_state,
-            engine_restart,
-            overlay_resize,
+            meetings::start_meeting,
+            meetings::stop_meeting,
+            meetings::active_meeting,
+            meetings::reprocess_meeting,
+            meetings::list_meetings,
+            meetings::get_transcript,
+            meetings::meeting_audio,
+            meetings::meeting_tracks,
+            meetings::dictation_find_tasks,
+            meetings::rename_meeting,
+            meetings::delete_meeting,
+            meetings::rename_speaker,
+            meetings::update_transcript_line,
+            update_dictation_text,
+            search_all,
+            engine_install,
+            meetings::call_prompt_accept,
+            meetings::call_prompt_dismiss,
+            system::watched_call_apps,
+            system::hardware_info,
+            system::resource_usage,
+            system::models_info,
+            system::delete_model,
+            meetings::dictation_to_meeting,
+            meetings::meeting_to_dictation,
+            tasks::list_tasks,
+            tasks::set_task_done,
+            tasks::update_task,
+            tasks::add_task,
+            tasks::delete_task,
+            tasks::reorder_tasks,
+            voice::voice_profile_info,
+            voice::enroll_start,
+            voice::enroll_stop,
+            voice::delete_voice_profile,
+            system::setup_status,
+            system::llm_pull,
+            system::engine_state,
+            system::engine_restart,
+            system::overlay_resize,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Voice Desk")
@@ -1104,4 +689,27 @@ pub fn run() {
                 shutdown_services(app);
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    /// The installer ships the engine's runtime modules, listed one by one in
+    /// tauri.conf.json (resources can't exclude files): tests and benchmarks stay
+    /// out, and a new module must not be forgotten.
+    #[test]
+    fn bundle_lists_every_engine_module() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let conf: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("tauri.conf.json")).unwrap()).unwrap();
+        let resources = conf["bundle"]["resources"].as_object().unwrap();
+        for e in std::fs::read_dir(root.join("../engine")).unwrap().flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".py") {
+                continue;
+            }
+            let listed = resources.contains_key(&format!("../engine/{name}"));
+            let runtime = !name.starts_with("test_") && !name.starts_with("bench_");
+            assert_eq!(listed, runtime, "{name}: listed in the bundle = {listed}");
+        }
+        assert!(!resources.keys().any(|k| k.contains('*') && k.ends_with(".py")));
+    }
 }

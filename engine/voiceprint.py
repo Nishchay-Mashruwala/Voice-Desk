@@ -2,7 +2,7 @@
 
 Uses the Wespeaker ResNet34 ONNX model (26 MB, not gated) on onnxruntime,
 with Kaldi-compatible filterbank features computed in numpy. Loading it costs
-~60 MB of RAM, versus ~700 MB for torch + pyannote.
+~60 MB of RAM, versus ~700 MB for a PyTorch model.
 """
 
 from __future__ import annotations
@@ -11,7 +11,8 @@ import functools
 
 import numpy as np
 
-SAMPLE_RATE = 16000
+from runtime import SAMPLE_RATE, hub_file
+
 REPO = "Wespeaker/wespeaker-voxceleb-resnet34-LM"
 FILENAME = "voxceleb_resnet34_LM.onnx"
 
@@ -62,6 +63,11 @@ def fbank(audio: np.ndarray) -> np.ndarray:
     return np.log(np.maximum(mel, eps)).astype(np.float32)
 
 
+def model_file() -> str:
+    """The model's file, downloaded (once, 26 MB) if it isn't cached."""
+    return hub_file(REPO, FILENAME, "Voice ID model")
+
+
 class VoicePrint:
     def __init__(self) -> None:
         self.session = None
@@ -70,15 +76,12 @@ class VoicePrint:
         if self.session is not None:
             return
         import onnxruntime as ort
-        from huggingface_hub import hf_hub_download
 
-        path = hf_hub_download(REPO, FILENAME)
+        path = model_file()
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = 2  # verification is tiny; don't compete with Whisper
+        opts.add_session_config_entry("session.intra_op.allow_spinning", "0")  # don't burn CPU while idle
         self.session = ort.InferenceSession(path, opts, providers=["CPUExecutionProvider"])
-
-    def unload(self) -> None:
-        self.session = None
 
     def embed(self, audio: np.ndarray) -> np.ndarray:
         """L2-normalised 256-dim speaker embedding."""

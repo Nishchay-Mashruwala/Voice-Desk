@@ -7,18 +7,68 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# Creates the draft release and uploads installers to it.
+permissions:
+  contents: write
+
 jobs:
+  # Fast checks first: a tag with mismatched versions or uncommitted files
+  # fails here, before three long builds.
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Versions match the tag, every module is committed
+        run: python scripts/check-release.py ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+
+      # The engine's unit tests only need NumPy (the heavy packages are imported lazily).
+      - name: Engine tests
+        working-directory: engine
+        run: |
+          python -m pip install numpy -c constraints.txt
+          python test_commands.py
+          python test_speakers.py
+          python test_mixed.py
+
+  rust-tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # The Tauri crate embeds the built frontend (dist/), so build it first.
+      - run: npm ci
+      - run: npm run build
+
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test
+
   build:
+    needs: [checks, rust-tests]
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: windows-latest
             args: ""
-          - os: macos-latest # Apple Silicon
-            args: "--target aarch64-apple-darwin"
-          - os: macos-13 # Intel
-            args: "--target x86_64-apple-darwin"
+          - os: macos-latest # one app for Apple Silicon and Intel Macs
+            args: "--target universal-apple-darwin"
           - os: ubuntu-24.04
             args: ""
     runs-on: ${{ matrix.os }}
@@ -29,8 +79,8 @@ jobs:
         if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
-            libasound2-dev libpipewire-0.3-dev libclang-dev libxdo-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf \
+            libasound2-dev libpipewire-0.3-dev libclang-dev libxdo-dev libdbus-1-dev libssl-dev
 
       - uses: actions/setup-node@v4
         with:
@@ -50,8 +100,25 @@ jobs:
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Signs updates so installed copies accept them (see README -> Releases).
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
-          releaseName: VoiceDesk ${{ github.ref_name }}
+          releaseName: Voice Desk ${{ github.ref_name }}
+          releaseBody: "Download the installer for your computer below. Voice Desk downloads the rest on first start (about 1-4 GB, depending on the computer)."
           releaseDraft: true
+          # latest.json: installed copies find updates here.
+          includeUpdaterJson: true
           args: ${{ matrix.args }}
+
+      # Manual runs make no release: keep the installers as downloadable artifacts.
+      - name: Upload installers
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: voice-desk-${{ runner.os }}
+          path: |
+            src-tauri/target/release/bundle/
+            src-tauri/target/*/release/bundle/
+          if-no-files-found: error

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   api,
   firstPhrase,
@@ -7,14 +7,16 @@ import {
   useEvent,
   type Dictation,
   type HeardPart,
+  type ModelDownload,
   type SessionStatus,
   type Settings,
   type SourceFocus,
 } from "../api";
 import Player from "../components/Player";
-import { Copy, ListCheck, Mic, Pause, Play, Stop, Trash, Users } from "../icons";
+import { Copy, ListCheck, Mic, Pause, Pencil, Play, Stop, Trash, Users } from "../icons";
 import { confirmDialog } from "../confirm";
 import { toast, undoToast } from "../toast";
+import { downloadText } from "../modelDownload";
 
 const STATE_TITLE: Record<string, string> = {
   idle: "Ready when you are",
@@ -49,24 +51,58 @@ interface FeedEntry {
 
 let feedId = 0;
 
+/** History rows drawn at first; more on request, so long histories stay quick. */
+const PAGE = 50;
+
+/**
+ * The orb's ring that grows with your voice. Polls the mic level every 80 ms,
+ * so it lives in its own component: only it re-renders, not the whole page.
+ */
+function OrbLevel() {
+  const [level, setLevel] = useState(0);
+  useEffect(() => {
+    let alive = true;
+    const t = setInterval(async () => {
+      if (document.hidden) return;
+      const l = (await api.audioLevels()).listening ?? 0;
+      if (alive) setLevel(l);
+    }, 80);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, []);
+  const scale = 1 + Math.min(0.35, Math.sqrt(level) * 2.2);
+  return <span className="orb-level" style={{ transform: `scale(${scale})` }} />;
+}
+
 export default function ListenView({
   settings,
   session,
   focus,
+  download,
   onOpenMeeting,
 }: {
   settings: Settings | null;
   session: SessionStatus | null;
   /** Opened from a task: the recording it came from. */
   focus?: SourceFocus;
+  /** A speech model being downloaded (first use of a model). */
+  download: ModelDownload | null;
   onOpenMeeting: (id: number) => void;
 }) {
   const [items, setItems] = useState<Dictation[]>([]);
+  const [loaded, setLoaded] = useState(false);
   const [feed, setFeed] = useState<FeedEntry[]>([]);
-  const [level, setLevel] = useState(0);
+  const [shown, setShown] = useState(PAGE);
+  const [editingId, setEditingId] = useState<number | null>(null);
 
   useEffect(() => {
-    api.listDictations().then(setItems);
+    api
+      .listDictations()
+      .then(setItems)
+      .catch((e) => toast(`Couldn't load your recordings: ${e}`))
+      .finally(() => setLoaded(true));
   }, []);
   useEvent<Dictation>("dictation-added", (d) => setItems((prev) => [d, ...prev]));
   // Tasks edited or deleted elsewhere change what's underlined.
@@ -77,18 +113,27 @@ export default function ListenView({
 
   const state = session?.state ?? "idle";
   const active = state !== "idle";
-  useEffect(() => {
-    if (!active) return;
-    const t = setInterval(async () => setLevel((await api.audioLevels()).listening ?? 0), 80);
-    return () => clearInterval(t);
-  }, [active]);
 
-  // Opened from a task: scroll to its recording and flash it.
+  // Opened from a task: scroll to its recording and flash it. Runs again once
+  // the history has loaded (it isn't there on the first render), and shows
+  // enough of the history to include it.
   const focusedId = focus?.dictationId;
   useEffect(() => {
-    if (focusedId === undefined) return;
+    if (focusedId === undefined || !loaded) return;
+    const at = items.findIndex((d) => d.id === focusedId);
+    if (at >= shown) {
+      setShown(at + 1);
+      return; // scrolls on the next run, once it's drawn
+    }
     document.querySelector(`[data-dictation="${focusedId}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" });
-  }, [focusedId, focus?.nonce]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusedId, focus?.nonce, loaded, shown]);
+
+  // One callback for every row, so the memoised players don't re-render.
+  const onEdited = useCallback((id: number, saved: { text: string; words: Dictation["words"] } | null) => {
+    setEditingId(null);
+    if (saved) setItems((prev) => prev.map((x) => (x.id === id ? { ...x, ...saved } : x)));
+  }, []);
 
   const toggle = async () => {
     try {
@@ -151,9 +196,14 @@ export default function ListenView({
     }
   };
 
+
   const copy = async (d: Dictation) => {
-    await navigator.clipboard.writeText(d.text);
-    toast("Copied to clipboard");
+    try {
+      await navigator.clipboard.writeText(d.text);
+      toast("Copied to clipboard");
+    } catch (e) {
+      toast(`Couldn't copy: ${e}`);
+    }
   };
 
   const name = settings?.assistant_name || "Jarvis";
@@ -168,7 +218,6 @@ export default function ListenView({
           ? `hold for ${settings?.long_press_s ?? 5}s`
           : "press";
   const orbCls = session?.capturing ? "capturing listening" : state === "listening" ? "listening" : state;
-  const scale = 1 + Math.min(0.35, Math.sqrt(level) * 2.2);
 
   const commands = settings
     ? [
@@ -194,7 +243,7 @@ export default function ListenView({
 
       <div className={`card hero ${active ? "active" : ""}`}>
         <button className={`orb ${orbCls}`} onClick={toggle} aria-label={active ? "Stop listening" : "Start listening"}>
-          {active && <span className="orb-level" style={{ transform: `scale(${scale})` }} />}
+          {active && <OrbLevel />}
           {active ? <Stop size={34} /> : <Mic size={40} />}
         </button>
         <div>
@@ -211,7 +260,10 @@ export default function ListenView({
                 Click the microphone or {how} <kbd>{hotkey}</kbd>.
               </>
             )}
-            {state === "starting" && "Loading the speech model — speak anyway, nothing is lost."}
+            {state === "starting" &&
+              (download
+                ? `${downloadText(download)} (first use only) — speak anyway, nothing is lost.`
+                : "Loading the speech model — speak anyway, nothing is lost.")}
             {state === "listening" && !session?.capturing && "Text appears at your cursor after each short pause."}
             {state === "paused" && `Not typing. Say “${name}, ${firstPhrase(settings?.cmd_resume ?? "resume")}” to continue.`}
             {session?.capturing &&
@@ -287,7 +339,7 @@ export default function ListenView({
         <div className="empty">Your recordings will appear here, with the text highlighted as it plays.</div>
       ) : (
         <ul className="list stagger">
-          {items.map((d, i) => (
+          {items.slice(0, shown).map((d, i) => (
             <li
               key={d.id}
               data-dictation={d.id}
@@ -310,6 +362,9 @@ export default function ListenView({
                 >
                   {converting === d.id ? <span className="spinner dark" /> : <Users size={16} />}
                 </button>
+                <button className="ghost icon" title="Fix the words" onClick={() => setEditingId(d.id)}>
+                  <Pencil size={15} />
+                </button>
                 <button className="ghost icon" title="Copy text" onClick={() => copy(d)}>
                   <Copy size={16} />
                 </button>
@@ -325,10 +380,17 @@ export default function ListenView({
                 durationS={d.duration_ms / 1000}
                 tasks={d.tasks}
                 focus={focusedId === d.id ? focus : undefined}
+                editing={editingId === d.id}
+                onEdited={onEdited}
               />
             </li>
           ))}
         </ul>
+      )}
+      {items.length > shown && (
+        <div className="row" style={{ justifyContent: "center", marginTop: 12 }}>
+          <button onClick={() => setShown((n) => n + PAGE)}>Show more ({items.length - shown} older)</button>
+        </div>
       )}
     </section>
   );

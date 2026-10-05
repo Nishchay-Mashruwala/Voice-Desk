@@ -31,3 +31,6 @@ __pycache__
 # Rust / Tauri
 src-tauri/target
 src-tauri/gen/schemas
+
+# Tauri bundle: VC++ runtime DLLs copied in by build.rs at build time
+src-tauri/redist/

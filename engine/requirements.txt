@@ -1,14 +1,16 @@
-# Speech engine dependencies. Install into the project's venv:
-#   Windows:      py -m venv .venv && .venv\Scripts\pip install -r engine/requirements.txt
-#   macOS/Linux:  python3 -m venv .venv && .venv/bin/pip install -r engine/requirements.txt
+# Speech engine: what every computer needs (~0.3 GB installed).
+#   uv pip install --python .venv/Scripts/python -r engine/requirements.txt -c engine/constraints.txt
+# constraints.txt holds the exact, tested versions (incl. everything these pull
+# in); the ranges here only say what the code needs.
+# Optional packs, installed only where they help:
+#   requirements-nvidia.txt  NVIDIA GPU speed-up for Whisper (~2 GB)
+#   requirements-indic.txt   Hindi/Gujarati written as spoken (PyTorch, ~0.7 GB)
 faster-whisper>=1.2
-pyannote.audio>=4.0
+ctranslate2>=4.5  # Whisper's inference library (imported directly for device checks)
+huggingface_hub>=1.0  # model downloads
 numpy>=2.0
 psutil>=5.9  # cores/RAM, to size models and threads to the computer
 onnxruntime>=1.17  # voice ID model, IndicConformer
-transformers>=4.40  # IndicConformer (Hindi/Gujarati script)
-onnx>=1.16  # shrinking IndicConformer to int8 (once)
-
-# NVIDIA GPU acceleration for Whisper (Windows/Linux only; harmless without a GPU).
-nvidia-cublas-cu12; sys_platform != "darwin"
-nvidia-cudnn-cu12==9.*; sys_platform != "darwin"
+sherpa-onnx>=1.12  # speaker detection (who spoke when), ~20 MB
+av>=11  # reading audio/video files
+truststore>=0.10  # use the system's certificates (works behind company proxies/antivirus)

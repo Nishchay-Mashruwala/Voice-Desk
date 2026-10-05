@@ -126,7 +126,11 @@ impl Recording {
                 let _ = thread.join();
                 return Err(e);
             }
-            Err(_) => return Err(anyhow!("audio device did not start in time")),
+            Err(_) => {
+                // It may still open later: tell its thread to close it right away.
+                let _ = tx.send(Msg::Stop);
+                return Err(anyhow!("audio device did not start in time"));
+            }
         }
         Ok(Self { tx, thread: Some(thread), level })
     }
@@ -212,26 +216,17 @@ impl Out {
     }
 }
 
-/// Mix 16 kHz mono WAVs (a meeting's mic + system tracks) into one, as long
-/// as the longest. Both tracks start at the same moment, so they stay in step.
-pub fn mix_wavs(inputs: &[&Path], out: &Path) -> Result<()> {
-    let mut mixed: Vec<i32> = Vec::new();
-    for path in inputs {
-        let mut r = hound::WavReader::open(path).with_context(|| format!("could not open {}", path.display()))?;
-        for (i, s) in r.samples::<i16>().enumerate() {
-            let s = s? as i32;
-            match mixed.get_mut(i) {
-                Some(m) => *m += s,
-                None => mixed.push(s),
-            }
-        }
-    }
-    let mut w = wav_writer(out)?;
-    for s in mixed {
-        w.write_sample(s.clamp(i16::MIN as i32, i16::MAX as i32) as i16)?;
-    }
-    w.finalize()?;
-    Ok(())
+/// A recording saved as `path` (.wav while recording), or its compressed
+/// .flac once processed. None if neither exists (deleted or expired).
+pub fn recorded(path: &Path) -> Option<PathBuf> {
+    let flac = path.with_extension("flac");
+    [path.to_path_buf(), flac].into_iter().find(|p| p.exists())
+}
+
+/// Delete a recording in whichever format it's in.
+pub fn remove_recording(path: &Path) {
+    let _ = std::fs::remove_file(path.with_extension("wav"));
+    let _ = std::fs::remove_file(path.with_extension("flac"));
 }
 
 fn record_thread(
@@ -413,22 +408,17 @@ mod tests {
     }
 
     #[test]
-    fn mixes_tracks_of_different_lengths() {
-        let dir = std::env::temp_dir().join(format!("vd-mix-{}", std::process::id()));
+    fn finds_a_recording_in_either_format() {
+        let dir = std::env::temp_dir().join(format!("vd-rec-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let write = |name: &str, samples: &[i16]| {
-            let p = dir.join(name);
-            let mut w = wav_writer(&p).unwrap();
-            samples.iter().for_each(|&s| w.write_sample(s).unwrap());
-            w.finalize().unwrap();
-            p
-        };
-        let a = write("a.wav", &[100, 200, 30_000]);
-        let b = write("b.wav", &[1, 2, 10_000, 7, 8]);
-        let out = dir.join("out.wav");
-        mix_wavs(&[&a, &b], &out).unwrap();
-        let got: Vec<i16> = hound::WavReader::open(&out).unwrap().samples::<i16>().map(Result::unwrap).collect();
-        assert_eq!(got, vec![101, 202, i16::MAX, 7, 8]); // longest length, clipped not wrapped
+        let wav = dir.join("meeting-1-mic.wav");
+        assert_eq!(recorded(&wav), None);
+        std::fs::write(dir.join("meeting-1-mic.flac"), b"fLaC").unwrap();
+        assert_eq!(recorded(&wav), Some(dir.join("meeting-1-mic.flac")));
+        std::fs::write(&wav, b"RIFF").unwrap(); // still being recorded: the WAV wins
+        assert_eq!(recorded(&wav), Some(wav.clone()));
+        remove_recording(&wav);
+        assert_eq!(recorded(&wav), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

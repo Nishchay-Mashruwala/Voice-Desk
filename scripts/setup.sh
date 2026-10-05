@@ -55,12 +55,8 @@ fi
 ok "$(cargo --version)"
 
 # ---------------------------------------------------------------------------
-step 2 "Ollama (runs the task AI)"
-if ! has ollama && [ ! -x /Applications/Ollama.app/Contents/Resources/ollama ]; then
-  if [ "$OS" = "Darwin" ]; then brew install ollama; else curl -fsSL https://ollama.com/install.sh | sh; fi
-fi
-OLLAMA="$(command -v ollama || echo /Applications/Ollama.app/Contents/Resources/ollama)"
-ok "Ollama installed"
+step 2 "Task AI"
+info "Nothing to install: Voice Desk downloads its task AI (llama.cpp + Qwen3) itself, from Settings -> Setup."
 
 # ---------------------------------------------------------------------------
 step 3 "Python speech engine"
@@ -71,7 +67,15 @@ if ! has uv; then
 fi
 [ -x "$PY" ] || uv venv --python 3.12 "$ROOT/.venv"
 info "Installing speech packages (first time: a few minutes)..."
-uv pip install --python "$PY" -r engine/requirements.txt
+uv pip install --python "$PY" -r engine/requirements.txt -c engine/constraints.txt
+if command -v nvidia-smi >/dev/null 2>&1; then
+  echo "NVIDIA GPU found: adding GPU speed-up (~2 GB)..."
+  uv pip install --python "$PY" -r engine/requirements-nvidia.txt -c engine/constraints.txt
+fi
+if [ "${VOICEDESK_INDIC:-0}" = "1" ]; then
+  echo "Adding Hindi/Gujarati support (~0.7 GB)..."
+  uv pip install --python "$PY" -r engine/requirements-indic.txt -c engine/constraints.txt --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match
+fi
 ok "Speech engine ready"
 
 # ---------------------------------------------------------------------------
@@ -79,14 +83,8 @@ step 4 "Speech models"
 "$PY" engine/engine.py --prefetch
 
 # ---------------------------------------------------------------------------
-step 5 "Task AI model (Qwen3 4B, about 2.5 GB)"
-if ! curl -s -m 3 http://127.0.0.1:11434/api/tags >/dev/null; then
-  info "Starting Ollama..."
-  nohup "$OLLAMA" serve >/dev/null 2>&1 &
-  sleep 5
-fi
-"$OLLAMA" pull qwen3:4b
-ok "Task AI ready"
+step 5 "Task AI model"
+info "Downloaded by Voice Desk on first start (Settings -> Setup -> Download): Qwen3 4B, about 2.5 GB."
 
 # ---------------------------------------------------------------------------
 step 6 "Building Voice Desk"

@@ -20,6 +20,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def main() -> None:
+    if len(sys.argv) < 2:  # a manual tool, not one of the automatic tests
+        print(__doc__.strip())
+        return
     path = sys.argv[1]
     profile = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] != "-" else None
     speed = float(sys.argv[3]) if len(sys.argv) > 3 else 1.0

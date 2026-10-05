@@ -58,8 +58,20 @@ impl Engine {
         *self.global.lock().unwrap() = Some(Arc::new(f));
     }
 
+    /// The folder with engine.py and its requirements files.
+    pub fn script_dir(&self) -> PathBuf {
+        self.script.parent().map(PathBuf::from).unwrap_or_default()
+    }
+
     pub fn is_installed(&self) -> bool {
-        self.python.exists() && self.script.exists()
+        // Python set up on first run counts only once that setup finished.
+        let first_run_python = self.python == crate::engine_setup::python_exe();
+        self.python.exists() && self.script.exists() && (!first_run_python || crate::engine_setup::installed_packs(&self.script_dir()).is_some())
+    }
+
+    /// Optional packs in the first-run Python (None: not set up yet, or a development .venv).
+    pub fn packs(&self) -> Option<crate::engine_setup::Packs> {
+        (self.python == crate::engine_setup::python_exe()).then(|| crate::engine_setup::installed_packs(&self.script_dir())).flatten()
     }
 
     pub fn is_running(&self) -> bool {
@@ -69,10 +81,15 @@ impl Engine {
         }
     }
 
+    /// The engine's process id while it runs (for its memory use).
+    pub fn pid(&self) -> Option<u32> {
+        self.proc.lock().unwrap().as_ref().map(|p| p.child.id())
+    }
+
     fn spawn(&self) -> Result<Proc> {
         if !self.python.exists() {
             return Err(anyhow!(
-                "Speech engine is not set up (missing {}). Run the setup script in the project folder.",
+                "Speech engine is not set up (missing {}). Open Settings → Setup to download it.",
                 self.python.display()
             ));
         }
@@ -112,6 +129,12 @@ impl Engine {
                     }
                     continue;
                 };
+                // Model downloads show in the app's status whichever request caused them.
+                if msg["event"] == "download" {
+                    if let Some(g) = &global {
+                        g(&msg);
+                    }
+                }
                 let mut p = pending.lock().unwrap();
                 if msg.get("event").is_some() {
                     if let Some(cb) = p.events.get(&id) {
@@ -149,13 +172,17 @@ impl Engine {
         Ok(Proc { child, stdin })
     }
 
-    fn write_line(&self, line: &str) -> Result<()> {
+    /// Write one request line, starting the engine first if `wake` (else fail when it's asleep).
+    fn write_line(&self, line: &str, wake: bool) -> Result<()> {
         let mut guard = self.proc.lock().unwrap();
         let alive = match guard.as_mut() {
             Some(p) => p.child.try_wait()?.is_none(),
             None => false,
         };
         if !alive {
+            if !wake {
+                return Err(anyhow!("speech engine not running"));
+            }
             *guard = Some(self.spawn()?);
         }
         let p = guard.as_mut().unwrap();
@@ -165,7 +192,11 @@ impl Engine {
     }
 
     /// Write a request now (preserving order with other writes) and return the reply receiver.
-    pub fn start_request(&self, cmd: &str, mut args: Value, on_event: Option<EventFn>) -> Result<Reply> {
+    pub fn start_request(&self, cmd: &str, args: Value, on_event: Option<EventFn>) -> Result<Reply> {
+        self.begin(cmd, args, on_event, true)
+    }
+
+    fn begin(&self, cmd: &str, mut args: Value, on_event: Option<EventFn>, wake: bool) -> Result<Reply> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         args["id"] = json!(id);
         args["cmd"] = json!(cmd);
@@ -178,7 +209,7 @@ impl Engine {
                 p.events.insert(id, cb);
             }
         }
-        if let Err(e) = self.write_line(&line) {
+        if let Err(e) = self.write_line(&line, wake) {
             let mut p = self.pending.lock().unwrap();
             p.replies.remove(&id);
             p.events.remove(&id);
@@ -194,6 +225,12 @@ impl Engine {
     /// Send a command and wait for its result. `on_event` receives progress/warning events.
     pub async fn request(&self, cmd: &str, args: Value, on_event: Option<EventFn>) -> Result<Value> {
         Self::wait(self.start_request(cmd, args, on_event)?).await
+    }
+
+    /// Ask only if the engine is running: a sleeping engine stays asleep (starting
+    /// it loads Python and ~0.5-1 GB of models just to answer).
+    pub async fn request_if_running(&self, cmd: &str, args: Value) -> Result<Value> {
+        Self::wait(self.begin(cmd, args, None, false)?).await
     }
 
     /// Fire-and-forget message (live audio). Never spawns the engine.

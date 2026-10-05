@@ -1,7 +1,12 @@
-//! Task extraction with a local LLM (Qwen3 4B) served by Ollama.
-//! Ollama is started automatically if it's installed but not running.
+//! Task extraction with a local LLM (Qwen3) run by llama.cpp's `llama-server`.
+//!
+//! Voice Desk downloads the server (~20-35 MB) and the model itself, starts the
+//! server only while finding tasks, and stops it a minute later to free the
+//! memory. Replaces Ollama, which was a separate 2.8 GB install.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -13,12 +18,17 @@ use crate::db::{NewTask, Segment, Settings};
 /// ~3k tokens per chunk keeps prompt + reply inside an 8k context, which fits a 4 GB GPU.
 const CHUNK_CHARS: usize = 12_000;
 const OVERLAP_CHARS: usize = 1_500;
-/// Most context the task AI gets (tokens). Each request asks only for what its
+/// Most context the task AI gets (tokens). Each job asks only for what its
 /// text needs: on a 4 GB GPU a full 8K context alone takes ~0.6 GB.
 const MAX_CTX: u32 = 8192;
 const MIN_CTX: u32 = 2048;
-/// Room for the answer (summary + tasks as JSON).
+/// Room for the answer (summary + tasks as JSON); also the most it may write.
 const ANSWER_TOKENS: u32 = 1536;
+/// The server is stopped this long after the last request, freeing its memory.
+const IDLE_STOP: Duration = Duration::from_secs(60);
+
+/// llama.cpp build to download (pinned: the same server everywhere).
+const LLAMA_BUILD: &str = "b11320";
 
 /// Context size for a prompt: roughly 3.5 English characters per token, and
 /// about one token per character of Hindi/Gujarati script. Rounded up to 1K.
@@ -28,22 +38,169 @@ pub fn context_for(prompt: &str) -> u32 {
     need.div_ceil(1024).saturating_mul(1024).clamp(MIN_CTX, MAX_CTX)
 }
 
-/// Ollama options that follow the Processor setting: CPU keeps every layer
-/// off the GPU; a chosen GPU is used first. CPU work uses half the cores.
-pub fn device_options(device: &str, prompt: &str) -> Value {
-    let mut o = json!({
-        "temperature": 0.1,
-        "num_ctx": context_for(prompt),
-        // A confused model on a slow laptop could otherwise write until the context is full.
-        "num_predict": ANSWER_TOKENS,
-        "num_thread": crate::hardware::worker_threads(),
-    });
-    if device == "cpu" {
-        o["num_gpu"] = json!(0);
-    } else if let Some(i) = device.strip_prefix("cuda:").and_then(|i| i.parse::<u32>().ok()) {
-        o["main_gpu"] = json!(i);
+/// The task models Voice Desk offers (Settings -> Task AI).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TaskModel {
+    /// Qwen3 1.7B: 1.1 GB. Lighter but less accurate: in the task tests it
+    /// copied an example from its instructions and invented due dates (1 of 3 failed).
+    Small,
+    /// Qwen3 4B: 2.5 GB, finds tasks more reliably.
+    Large,
+}
+
+impl TaskModel {
+    /// "auto": the 4B (passes all task tests; ~3 GB of RAM while running),
+    /// unless the computer has under 6 GB of RAM. "qwen3-1.7b" / "qwen3-4b" choose.
+    pub fn from_setting(value: &str, ram_gb: f64) -> Self {
+        match value {
+            "qwen3-1.7b" => Self::Small,
+            "qwen3-4b" => Self::Large,
+            _ if ram_gb >= 6.0 => Self::Large,
+            _ => Self::Small,
+        }
     }
-    o
+    pub fn file(self) -> &'static str {
+        match self {
+            Self::Small => "Qwen3-1.7B-Q4_K_M.gguf",
+            Self::Large => "Qwen3-4B-Q4_K_M.gguf",
+        }
+    }
+    /// Pinned to a commit: the same file everywhere, matching its SHA-256 in downloads.rs.
+    pub fn url(self) -> String {
+        let (repo, commit) = match self {
+            Self::Small => ("unsloth/Qwen3-1.7B-GGUF", "d7f544eead698dbd1f15126ef60b45a1e1933222"),
+            Self::Large => ("unsloth/Qwen3-4B-GGUF", "22c9fc8a8c7700b76a1789366280a6a5a1ad1120"),
+        };
+        format!("https://huggingface.co/{repo}/resolve/{commit}/{}", self.file())
+    }
+    /// Download size, for the free-space check.
+    fn size_gb(self) -> f64 {
+        match self {
+            Self::Small => 1.1,
+            Self::Large => 2.5,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Small => "Qwen3 1.7B (1.1 GB)",
+            Self::Large => "Qwen3 4B (2.5 GB)",
+        }
+    }
+}
+
+fn ram_gb() -> f64 {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    sys.total_memory() as f64 / 1e9
+}
+
+/// The model the current settings use.
+pub fn task_model(settings: &Settings) -> TaskModel {
+    TaskModel::from_setting(&settings.llm_model, ram_gb())
+}
+
+/// Vulkan runs on NVIDIA, AMD and Intel GPUs without CUDA libraries; it needs
+/// the GPU driver's Vulkan loader. Without one, the CPU build.
+fn has_vulkan() -> bool {
+    if cfg!(windows) {
+        std::env::var_os("SystemRoot").is_some_and(|r| PathBuf::from(r).join("System32").join("vulkan-1.dll").exists())
+    } else if cfg!(target_os = "linux") {
+        ["/usr/lib/x86_64-linux-gnu/libvulkan.so.1", "/usr/lib/libvulkan.so.1", "/usr/lib64/libvulkan.so.1"]
+            .iter()
+            .any(|p| std::path::Path::new(p).exists())
+    } else {
+        false // macOS builds use Metal
+    }
+}
+
+/// (download name, folder name) of the llama.cpp build for this computer.
+fn server_build() -> (String, String) {
+    let flavour = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("windows", _) if has_vulkan() => "win-vulkan-x64.zip",
+        ("windows", _) => "win-cpu-x64.zip",
+        ("macos", "aarch64") => "macos-arm64.tar.gz",
+        ("macos", _) => "macos-x64.tar.gz",
+        ("linux", "aarch64") => "ubuntu-arm64.tar.gz",
+        _ if has_vulkan() => "ubuntu-vulkan-x64.tar.gz",
+        _ => "ubuntu-x64.tar.gz",
+    };
+    let file = format!("llama-{LLAMA_BUILD}-bin-{flavour}");
+    let folder = file.trim_end_matches(".zip").trim_end_matches(".tar.gz").to_string();
+    (file, folder)
+}
+
+fn server_dir() -> PathBuf {
+    crate::system::voicedesk_models_dir().parent().map(|p| p.join("llama")).unwrap_or_default().join(server_build().1)
+}
+
+fn server_exe() -> PathBuf {
+    server_dir().join(if cfg!(windows) { "llama-server.exe" } else { "llama-server" })
+}
+
+fn model_path(m: TaskModel) -> PathBuf {
+    crate::system::voicedesk_models_dir().join(m.file())
+}
+
+/// llama.cpp's Windows builds need the Visual C++ runtime, which a fresh Windows
+/// doesn't have and the zip doesn't include (without it llama-server won't
+/// start). Voice Desk ships these (Microsoft allows app-local copies, see build.rs).
+const VC_RUNTIME: [&str; 3] = ["msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"];
+
+/// Put any missing Visual C++ runtime DLL beside llama-server (also fixes
+/// installs unpacked before Voice Desk shipped them).
+fn add_vc_runtime(redist: Option<&Path>, dir: &Path) {
+    let Some(redist) = redist.filter(|_| cfg!(windows)) else { return };
+    for dll in VC_RUNTIME {
+        let to = dir.join(dll);
+        if !to.exists() {
+            if let Err(e) = std::fs::copy(redist.join(dll), &to) {
+                eprintln!("[llm] couldn't add {dll}: {e}");
+            }
+        }
+    }
+}
+
+/// Arguments for `llama-server`. CPU only keeps every layer off the GPU; heavy
+/// work uses half the CPU cores, for reading the prompt (`-tb`) as well as
+/// writing; idle threads sleep instead of spinning (`--poll 0`), and two HTTP
+/// threads are plenty for one request at a time. The working memory (KV cache)
+/// is 8-bit.
+pub fn server_args(model: &std::path::Path, port: u16, ctx: u32, device: &str, threads: usize) -> Vec<String> {
+    let mut a: Vec<String> = vec![
+        "-m".into(),
+        model.to_string_lossy().into(),
+        "--host".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        port.to_string(),
+        "-c".into(),
+        ctx.to_string(),
+        "-np".into(),
+        "1".into(),
+        "-t".into(),
+        threads.to_string(),
+        "-tb".into(),
+        threads.to_string(),
+        "--poll".into(),
+        "0".into(),
+        "--threads-http".into(),
+        "2".into(),
+        "--jinja".into(), // Qwen3's chat template (lets thinking be turned off)
+        "--no-webui".into(),
+        "-fa".into(),
+        "on".into(),
+        "--cache-type-k".into(),
+        "q8_0".into(),
+        "--cache-type-v".into(),
+        "q8_0".into(),
+        "-ngl".into(),
+        if device == "cpu" { "0" } else { "99" }.into(),
+    ];
+    if device == "cpu" {
+        // Without this the Vulkan build still opens the GPU (~0.1 GB) with no layers on it.
+        a.extend(["--device".into(), "none".into()]);
+    }
+    a
 }
 
 #[derive(Debug, Deserialize)]
@@ -169,205 +326,286 @@ pub enum Mode {
     SelfNotes,
 }
 
+struct Server {
+    child: std::process::Child,
+    port: u16,
+    ctx: u32,
+    model: TaskModel,
+    device: String,
+}
+
 pub struct Llm {
     http: reqwest::Client,
-    /// The `ollama serve` we started, so it can be stopped when Voice Desk exits.
-    spawned: std::sync::Mutex<Option<std::process::Child>>,
+    server: Arc<Mutex<Option<Server>>>,
+    /// Bumped when a request starts and when it ends; an idle timer only stops
+    /// a server nothing has used since the timer was set.
+    used: Arc<AtomicU64>,
+    /// Requests being answered: the idle timer never stops the server under one.
+    in_flight: Arc<AtomicUsize>,
+    /// One job at a time (the server has one slot).
+    busy: tokio::sync::Mutex<()>,
+    /// The Visual C++ runtime DLLs shipped with Voice Desk (Windows).
+    redist: Option<PathBuf>,
+}
+
+/// A request to the server; when it ends (however it ends), the idle timer starts.
+struct InFlight<'a>(&'a Llm);
+
+impl<'a> InFlight<'a> {
+    fn new(llm: &'a Llm) -> Self {
+        llm.in_flight.fetch_add(1, Ordering::SeqCst);
+        llm.used.fetch_add(1, Ordering::SeqCst);
+        Self(llm)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.0.stop_when_idle();
+    }
+}
+
+/// Nothing is being answered, and no request started or ended since `used` was `n`.
+fn unused_since(in_flight: &AtomicUsize, used: &AtomicU64, n: u64) -> bool {
+    in_flight.load(Ordering::SeqCst) == 0 && used.load(Ordering::SeqCst) == n
 }
 
 #[derive(serde::Serialize)]
 pub struct LlmStatus {
+    /// The server program is downloaded.
     pub installed: bool,
     pub running: bool,
+    /// The model the settings use is downloaded.
     pub model_ready: bool,
+    /// "Qwen3 4B (2.5 GB)"
+    pub model: String,
     pub message: String,
 }
 
-/// Where Ollama usually lives, plus whatever is on PATH.
-fn find_ollama() -> Option<PathBuf> {
-    let exe = if cfg!(windows) { "ollama.exe" } else { "ollama" };
-    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).map(|d| d.join(exe)).collect())
-        .unwrap_or_default();
-    if cfg!(windows) {
-        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-            candidates.push(PathBuf::from(local).join("Programs").join("Ollama").join(exe));
+/// Windows: put a helper process in a job that Windows ends together with
+/// Voice Desk (even if Voice Desk crashes), so it never lingers holding GBs of RAM.
+#[cfg(windows)]
+fn end_with_voice_desk(child: &std::process::Child) {
+    use std::os::windows::io::AsRawHandle;
+    use std::sync::OnceLock;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    static JOB: OnceLock<usize> = OnceLock::new();
+    let job = *JOB.get_or_init(|| unsafe {
+        let Ok(job) = CreateJobObjectW(None, None) else { return 0 };
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let _ = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        job.0 as usize // kept open for Voice Desk's lifetime
+    });
+    if job != 0 {
+        unsafe {
+            let _ = AssignProcessToJobObject(HANDLE(job as *mut _), HANDLE(child.as_raw_handle()));
         }
-    } else if cfg!(target_os = "macos") {
-        candidates.push("/Applications/Ollama.app/Contents/Resources/ollama".into());
-        candidates.push("/opt/homebrew/bin/ollama".into());
-        candidates.push("/usr/local/bin/ollama".into());
-    } else {
-        candidates.push("/usr/local/bin/ollama".into());
-        candidates.push("/usr/bin/ollama".into());
     }
-    candidates.into_iter().find(|p| p.is_file())
 }
 
-fn is_local(url: &str) -> bool {
-    url.contains("127.0.0.1") || url.contains("localhost")
+#[cfg(not(windows))]
+fn end_with_voice_desk(_child: &std::process::Child) {}
+
+fn free_port() -> Result<u16> {
+    Ok(std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
+}
+
+fn stop(server: &mut Option<Server>) {
+    if let Some(mut s) = server.take() {
+        let _ = s.child.kill();
+        let _ = s.child.wait();
+    }
+}
+
+impl Drop for Llm {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 impl Llm {
-    pub fn new() -> Self {
+    /// `redist`: the folder with the Visual C++ runtime DLLs (Windows; see `VC_RUNTIME`).
+    pub fn new(redist: Option<PathBuf>) -> Self {
         Self {
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(900))
-                .build()
-                .expect("http client"),
-            spawned: std::sync::Mutex::new(None),
+            http: reqwest::Client::builder().timeout(Duration::from_secs(900)).build().expect("http client"),
+            server: Arc::new(Mutex::new(None)),
+            used: Arc::new(AtomicU64::new(0)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            busy: tokio::sync::Mutex::new(()),
+            redist,
         }
     }
 
-    /// Stop the Ollama server Voice Desk started (an Ollama that was already
-    /// running before Voice Desk opened is left alone).
+    /// Stop the task AI (Voice Desk is closing).
     pub fn shutdown(&self) {
-        let Some(mut child) = self.spawned.lock().unwrap().take() else { return };
-        #[cfg(windows)]
-        {
-            // Also ends the model runner processes Ollama started.
-            use std::os::windows::process::CommandExt;
-            let _ = std::process::Command::new("taskkill")
-                .args(["/PID", &child.id().to_string(), "/T", "/F"])
-                .creation_flags(0x0800_0000)
-                .status();
-        }
-        let _ = child.kill();
-        let _ = child.wait();
+        stop(&mut self.server.lock().unwrap());
     }
 
-    fn url(settings: &Settings, path: &str) -> String {
-        format!("{}{path}", settings.ollama_url.trim_end_matches('/'))
+    /// The server's process id while it runs (for its memory use).
+    pub fn pid(&self) -> Option<u32> {
+        self.server.lock().unwrap().as_ref().map(|s| s.child.id())
     }
 
-    async fn tags(&self, settings: &Settings) -> Option<Value> {
-        let resp = self
-            .http
-            .get(Self::url(settings, "/api/tags"))
-            .timeout(Duration::from_secs(3))
-            .send()
-            .await
-            .ok()?;
-        resp.json().await.ok()
-    }
-
-    fn has_model(tags: &Value, model: &str) -> bool {
-        let want = if model.contains(':') { model.to_string() } else { format!("{model}:latest") };
-        tags["models"]
-            .as_array()
-            .map(|a| a.iter().any(|m| m["name"].as_str() == Some(want.as_str())))
-            .unwrap_or(false)
-    }
-
-    /// Start `ollama serve` in the background if it's installed but not running.
-    pub async fn ensure_running(&self, settings: &Settings) -> Result<()> {
-        if self.tags(settings).await.is_some() {
-            return Ok(());
-        }
-        if !is_local(&settings.ollama_url) {
-            return Err(anyhow!("Could not reach Ollama at {}", settings.ollama_url));
-        }
-        let bin = find_ollama()
-            .ok_or_else(|| anyhow!("Ollama is not installed. Download it from https://ollama.com/download"))?;
-        let mut cmd = std::process::Command::new(bin);
-        cmd.arg("serve")
-            // Half-size working memory (KV cache) with no loss worth noticing in task extraction.
-            .env("OLLAMA_FLASH_ATTENTION", "1")
-            .env("OLLAMA_KV_CACHE_TYPE", "q8_0")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        }
-        let child = cmd.spawn().context("could not start Ollama")?;
-        *self.spawned.lock().unwrap() = Some(child);
-        for _ in 0..40 {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            if self.tags(settings).await.is_some() {
-                return Ok(());
-            }
-        }
-        Err(anyhow!("Ollama was started but isn't responding"))
-    }
-
-    pub async fn status(&self, settings: &Settings) -> LlmStatus {
-        let installed = find_ollama().is_some() || !is_local(&settings.ollama_url);
-        let running = installed && self.ensure_running(settings).await.is_ok();
-        let tags = if running { self.tags(settings).await } else { None };
-        let model_ready = tags.as_ref().is_some_and(|t| Self::has_model(t, &settings.llm_model));
-        let message = if !installed {
-            "Ollama is not installed. Download it from https://ollama.com/download".into()
-        } else if !running {
-            "Ollama is installed but could not be started.".into()
-        } else if !model_ready {
-            format!("The '{}' model needs to be downloaded (about 2.5 GB).", settings.llm_model)
+    pub fn status(&self, settings: &Settings) -> LlmStatus {
+        let model = task_model(settings);
+        let installed = server_exe().exists();
+        let model_ready = model_path(model).exists();
+        let running = self.server.lock().unwrap().is_some();
+        let message = if !installed || !model_ready {
+            format!("Download the task AI to find tasks ({} plus a ~30 MB runner).", model.label())
         } else {
-            format!("Ready: '{}'", settings.llm_model)
+            format!("Ready: {}", model.label())
         };
-        LlmStatus { installed, running, model_ready, message }
+        LlmStatus { installed, running, model_ready, model: model.label().into(), message }
     }
 
-    /// Download the model, reporting (status, percent or -1).
+    /// Download the server and the model the settings use; `on_progress(status, percent)`.
     pub async fn pull(&self, settings: &Settings, mut on_progress: impl FnMut(&str, f64)) -> Result<()> {
-        self.ensure_running(settings).await?;
-        let mut resp = self
-            .http
-            .post(Self::url(settings, "/api/pull"))
-            .timeout(Duration::from_secs(6 * 3600))
-            .json(&json!({ "model": settings.llm_model, "stream": true }))
-            .send()
+        let model = task_model(settings);
+        let need = [(!server_exe().exists(), 0.1), (!model_path(model).exists(), model.size_gb())];
+        crate::downloads::ensure_free_space(need.iter().filter(|n| n.0).map(|n| n.1).sum())?;
+        let http = crate::downloads::client();
+        if !server_exe().exists() {
+            let (file, _) = server_build();
+            let url = format!("https://github.com/ggml-org/llama.cpp/releases/download/{LLAMA_BUILD}/{file}");
+            // Keep the real name: its extension says how to unpack it.
+            let archive = server_dir().parent().map(|d| d.join(&file)).context("no folder for the task AI")?;
+            crate::downloads::fetch(&http, &url, &archive, crate::downloads::sha256_of(&file), |d, t| {
+                on_progress("Downloading the task AI runner", if t > 0 { d as f64 / t as f64 * 100.0 } else { -1.0 })
+            })
             .await?;
-        let mut buf = Vec::new();
-        while let Some(chunk) = resp.chunk().await? {
-            buf.extend_from_slice(&chunk);
-            while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
-                let line: Vec<u8> = buf.drain(..=nl).collect();
-                let Ok(v) = serde_json::from_slice::<Value>(&line) else { continue };
-                if let Some(e) = v["error"].as_str() {
-                    return Err(anyhow!("download failed: {e}"));
-                }
-                let pct = match (v["completed"].as_f64(), v["total"].as_f64()) {
-                    (Some(c), Some(t)) if t > 0.0 => c / t * 100.0,
-                    _ => -1.0,
-                };
-                on_progress(v["status"].as_str().unwrap_or(""), pct);
-            }
+            // Only the server and its libraries (not the dozens of other tools).
+            // (Other tools' libraries, like llama-cli-impl.dll, are skipped; tested: the
+            // server runs without them. llama-common, ggml-* and the CPU variants are needed.)
+            let keep = |n: &str| {
+                let other_tool = n.contains("-impl.") && !n.starts_with("llama-server");
+                !other_tool
+                    && (n.starts_with("llama-server")
+                        || [".dll", ".so", ".dylib", ".metal"].iter().any(|e| n.ends_with(e))
+                        || n.contains(".so.")
+                        || n.contains(".dylib"))
+            };
+            // Unpacked beside its folder, then moved in: llama-server being there
+            // must mean every library is too.
+            let staging = crate::downloads::staging(&server_dir());
+            crate::downloads::unpack(&archive, &staging, keep)?;
+            add_vc_runtime(self.redist.as_deref(), &staging);
+            crate::downloads::commit(&staging, &server_dir())?;
+            let _ = std::fs::remove_file(&archive);
         }
+        let sha = crate::downloads::sha256_of(model.file());
+        crate::downloads::fetch(&http, &model.url(), &model_path(model), sha, |d, t| {
+            on_progress(&format!("Downloading {}", model.label()), if t > 0 { d as f64 / t as f64 * 100.0 } else { -1.0 })
+        })
+        .await?;
+        on_progress("Ready", 100.0);
         Ok(())
     }
 
+    /// Start (or restart, for a bigger context or another model) the server.
+    async fn ensure_running(&self, settings: &Settings, ctx: u32) -> Result<u16> {
+        let model = task_model(settings);
+        let (exe, gguf) = (server_exe(), model_path(model));
+        if !exe.exists() || !gguf.exists() {
+            return Err(anyhow!("The task AI isn't downloaded yet. Open Settings → Setup to download it."));
+        }
+        {
+            let mut guard = self.server.lock().unwrap();
+            let reusable = guard.as_mut().is_some_and(|s| {
+                matches!(s.child.try_wait(), Ok(None)) && s.ctx >= ctx && s.model == model && s.device == settings.device
+            });
+            if reusable {
+                return Ok(guard.as_ref().unwrap().port);
+            }
+            stop(&mut guard);
+            add_vc_runtime(self.redist.as_deref(), &server_dir());
+            let port = free_port()?;
+            let threads = crate::hardware::worker_threads();
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.args(server_args(&gguf, port, ctx, &settings.device, threads))
+                // The Windows builds use OpenMP (libomp.dll): the same thread cap,
+                // and threads that sleep between jobs instead of spinning.
+                .env("OMP_NUM_THREADS", threads.to_string())
+                .env("OMP_WAIT_POLICY", "PASSIVE")
+                .current_dir(server_dir())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            }
+            let child = cmd.spawn().context("could not start the task AI")?;
+            end_with_voice_desk(&child);
+            *guard = Some(Server { child, port, ctx, model, device: settings.device.clone() });
+        }
+        let port = self.server.lock().unwrap().as_ref().map(|s| s.port).unwrap_or_default();
+        // Loading the model takes a few seconds (longer on the first run).
+        for _ in 0..240 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let alive = self.server.lock().unwrap().as_mut().is_some_and(|s| matches!(s.child.try_wait(), Ok(None)));
+            if !alive {
+                stop(&mut self.server.lock().unwrap());
+                return Err(anyhow!("The task AI stopped while starting (not enough memory?)"));
+            }
+            let health = self.http.get(format!("http://127.0.0.1:{port}/health")).timeout(Duration::from_secs(2)).send().await;
+            if health.is_ok_and(|r| r.status().is_success()) {
+                return Ok(port);
+            }
+        }
+        stop(&mut self.server.lock().unwrap());
+        Err(anyhow!("The task AI didn't start in time"))
+    }
+
+    /// Stop the server once it has been idle for IDLE_STOP. (A timer set by an
+    /// earlier request must not stop it in the middle of a later one.)
+    fn stop_when_idle(&self) {
+        let n = self.used.fetch_add(1, Ordering::SeqCst) + 1;
+        let (used, in_flight, server) = (self.used.clone(), self.in_flight.clone(), self.server.clone());
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(IDLE_STOP).await;
+            // Checked under the server lock, which a new request takes to use the server.
+            let mut guard = server.lock().unwrap();
+            if unused_since(&in_flight, &used, n) {
+                stop(&mut guard);
+            }
+        });
+    }
+
     async fn chat(&self, settings: &Settings, system: &str, user: &str) -> Result<Value> {
+        let _in_flight = InFlight::new(self);
+        let port = self.ensure_running(settings, context_for(&format!("{system}{user}"))).await?;
         let body = json!({
-            "model": settings.llm_model,
-            "stream": false,
-            "think": false,
-            "format": schema(),
-            // Free GPU/RAM soon after extraction instead of Ollama's default 5 minutes.
-            "keep_alive": "1m",
-            "options": device_options(&settings.whisper_device, &format!("{system}{user}")),
             "messages": [
                 { "role": "system", "content": system },
                 { "role": "user", "content": user }
-            ]
+            ],
+            "temperature": 0.1,
+            // A confused model on a slow laptop could otherwise write until the context is full.
+            "max_tokens": ANSWER_TOKENS,
+            "response_format": { "type": "json_schema", "json_schema": { "name": "tasks", "schema": schema() } },
+            "chat_template_kwargs": { "enable_thinking": false },
         });
-        let resp = self.http.post(Self::url(settings, "/api/chat")).json(&body).send().await?;
+        let resp = self.http.post(format!("http://127.0.0.1:{port}/v1/chat/completions")).json(&body).send().await?;
         let status = resp.status();
         let v: Value = resp.json().await?;
         if !status.is_success() {
-            let msg = v["error"].as_str().unwrap_or("unknown");
-            if msg.contains("not found") {
-                return Err(anyhow!(
-                    "The '{}' model isn't downloaded yet. Open Settings → Setup to download it.",
-                    settings.llm_model
-                ));
-            }
-            return Err(anyhow!("Ollama error {status}: {msg}"));
+            return Err(anyhow!("task AI error {status}: {}", v["error"]["message"].as_str().unwrap_or("unknown")));
         }
-        let content = v["message"]["content"].as_str().context("empty LLM response")?;
-        serde_json::from_str(content).with_context(|| format!("LLM returned invalid JSON: {content}"))
+        let content = v["choices"][0]["message"]["content"].as_str().context("empty task AI response")?;
+        serde_json::from_str(content).with_context(|| format!("task AI returned invalid JSON: {content}"))
     }
 
     pub async fn extract(
@@ -378,6 +616,7 @@ impl Llm {
         mode: Mode,
         on_progress: impl FnMut(usize, usize),
     ) -> Result<Extraction> {
+        let _one_at_a_time = self.busy.lock().await;
         let mut e = self.extract_raw(settings, title, segments, mode, on_progress).await?;
         // Small models sometimes garble labels ("Speaker :1"); snap them back to real speakers.
         let key = |s: &str| s.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase();
@@ -406,7 +645,6 @@ impl Llm {
         if transcript.trim().is_empty() {
             return Ok(Extraction { summary: "No speech was detected.".into(), tasks: vec![] });
         }
-        self.ensure_running(settings).await?;
         let chunks = chunk(&transcript);
         let me = who_am_i(settings);
         let (system, ask) = match mode {
@@ -466,20 +704,77 @@ mod tests {
         assert_eq!(context_for(&"word ".repeat(2000)), 5120); // 10K chars ≈ 2.9K tokens + answer
         assert_eq!(context_for(&"ક".repeat(4000)), 6144); // Gujarati: ~1 token per character
         assert_eq!(context_for(&"x".repeat(100_000)), MAX_CTX);
-        assert_eq!(device_options("cpu", "")["num_gpu"], 0);
-        assert_eq!(device_options("cuda:1", "")["main_gpu"], 1);
-        assert!(device_options("auto", "").get("num_gpu").is_none());
+    }
+
+    #[test]
+    fn server_follows_the_processor_setting() {
+        let args = |d| server_args(std::path::Path::new("m.gguf"), 8080, 4096, d, 4).join(" ");
+        assert!(args("cpu").ends_with("-ngl 0 --device none"));
+        assert!(args("auto").ends_with("-ngl 99"));
+        assert!(args("cpu").contains("-c 4096") && args("cpu").contains("-t 4") && args("cpu").contains("--cache-type-k q8_0"));
+        // Prompt reading capped too, no spinning threads, few HTTP threads.
+        assert!(args("cpu").contains("-tb 4 --poll 0 --threads-http 2"));
+    }
+
+    #[test]
+    fn models_are_pinned_and_checked() {
+        for m in [TaskModel::Small, TaskModel::Large] {
+            assert!(!m.url().contains("/resolve/main/"), "{}", m.url());
+            assert!(crate::downloads::sha256_of(m.file()).is_some(), "{}", m.file());
+        }
+        assert!(crate::downloads::sha256_of(&server_build().0).is_some(), "no SHA-256 for {}", server_build().0);
+    }
+
+    #[test]
+    fn idle_timer_never_stops_a_request_in_flight() {
+        let (in_flight, used) = (AtomicUsize::new(0), AtomicU64::new(0));
+        let start = || {
+            in_flight.fetch_add(1, Ordering::SeqCst);
+            used.fetch_add(1, Ordering::SeqCst);
+        };
+        let end = || {
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+            used.fetch_add(1, Ordering::SeqCst) + 1 // the timer this sets
+        };
+        start();
+        let first_timer = end();
+        start(); // a second request starts before the first timer fires
+        assert!(!unused_since(&in_flight, &used, first_timer));
+        let second_timer = end();
+        assert!(!unused_since(&in_flight, &used, first_timer));
+        assert!(unused_since(&in_flight, &used, second_timer));
+    }
+
+    #[test]
+    fn task_model_by_ram() {
+        assert_eq!(TaskModel::from_setting("auto", 4.0), TaskModel::Small);
+        assert_eq!(TaskModel::from_setting("auto", 8.0), TaskModel::Large);
+        assert_eq!(TaskModel::from_setting("auto", 15.4), TaskModel::Large);
+        assert_eq!(TaskModel::from_setting("qwen3-1.7b", 32.0), TaskModel::Small);
+        assert_eq!(TaskModel::from_setting("qwen3:4b", 4.0), TaskModel::Small); // old Ollama name: treated as auto
+    }
+
+    /// Downloads the server and model if needed (~1-2.5 GB once).
+    async fn llm(settings: &Settings) -> Llm {
+        let l = Llm::new(None);
+        l.pull(settings, |_, _| {}).await.unwrap();
+        l
+    }
+
+    fn test_model() -> String {
+        std::env::var("VOICEDESK_LLM").unwrap_or_else(|_| "auto".into())
     }
 
     fn seg(start: f64, speaker: &str, text: &str) -> Segment {
         Segment { start, end: start + 4.0, speaker: speaker.into(), text: text.into(), words: None }
     }
 
-    /// Needs a running Ollama with qwen3:4b. Run: cargo test -- --ignored --nocapture
+    /// Needs the task AI (downloaded on first run). Run: cargo test llm -- --ignored --nocapture
+    /// VOICEDESK_LLM=qwen3-1.7b or qwen3-4b picks the model (default: auto).
     #[tokio::test(flavor = "current_thread")]
     #[ignore]
     async fn extracts_only_my_tasks() {
-        let settings = Settings { user_name: "Rajvee".into(), ..Settings::default() };
+        let settings = Settings { user_name: "Rajvee".into(), llm_model: test_model(), ..Settings::default() };
         let segments = vec![
             seg(0.0, "Speaker 1", "Okay let's get started. Quick updates on the launch."),
             seg(6.0, "Me", "The login page is done, I'm waiting on design review."),
@@ -488,7 +783,7 @@ mod tests {
             seg(25.0, "Speaker 2", "I'll take care of the marketing email this week."),
             seg(31.0, "Speaker 1", "Thanks. Priya, please update the roadmap slide."),
         ];
-        let e = Llm::new().extract(&settings, "Launch sync", &segments, Mode::Meeting, |_, _| {}).await.unwrap();
+        let e = llm(&settings).await.extract(&settings, "Launch sync", &segments, Mode::Meeting, |_, _| {}).await.unwrap();
         println!("summary: {}", e.summary);
         for t in &e.tasks {
             println!("- {} | by {:?} | due {:?} | {:?}", t.description, t.assigned_by, t.due, t.quote);
@@ -503,12 +798,12 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[ignore]
     async fn tasks_assigned_by_name() {
-        let settings = Settings { user_name: "Nishchay".into(), ..Settings::default() };
+        let settings = Settings { user_name: "Nishchay".into(), llm_model: test_model(), ..Settings::default() };
         let segments = vec![
             seg(0.0, "Speaker 1", "Hello, hello, good morning to everyone. Nishchay, you need to complete doing this task, which is eating an apple."),
             seg(9.5, "Speaker 1", "And Nishchay, I am giving you another task of playing games."),
         ];
-        let e = Llm::new().extract(&settings, "Test", &segments, Mode::Meeting, |_, _| {}).await.unwrap();
+        let e = llm(&settings).await.extract(&settings, "Test", &segments, Mode::Meeting, |_, _| {}).await.unwrap();
         for t in &e.tasks {
             println!("- {} | by {:?} | due {:?}", t.description, t.assigned_by, t.due);
         }
@@ -520,13 +815,13 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[ignore]
     async fn self_notes() {
-        let settings = Settings { user_name: "Nishchay".into(), ..Settings::default() };
+        let settings = Settings { user_name: "Nishchay".into(), llm_model: test_model(), ..Settings::default() };
         let segments = vec![seg(
             0.0,
             "Me",
             "I need to call the bank tomorrow morning and renew my passport next week. Also buy milk.",
         )];
-        let e = Llm::new().extract(&settings, "Notes", &segments, Mode::SelfNotes, |_, _| {}).await.unwrap();
+        let e = llm(&settings).await.extract(&settings, "Notes", &segments, Mode::SelfNotes, |_, _| {}).await.unwrap();
         for t in &e.tasks {
             println!("- {} | by {:?} | due {:?}", t.description, t.assigned_by, t.due);
         }

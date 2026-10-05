@@ -1,0 +1,5 @@
+# NVIDIA GPU acceleration for Whisper (Windows/Linux). ~2 GB; skip on computers
+# without an NVIDIA GPU - Whisper then runs on the CPU.
+# Versions are pinned in constraints.txt (install with -c engine/constraints.txt).
+nvidia-cublas-cu12; sys_platform != "darwin"
+nvidia-cudnn-cu12==9.*; sys_platform != "darwin"

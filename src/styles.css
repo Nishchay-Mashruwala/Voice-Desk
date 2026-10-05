@@ -326,16 +326,6 @@ kbd {
   border-radius: 11px;
   box-shadow: 0 6px 18px rgba(109, 93, 252, 0.4);
 }
-.brand-mark {
-  width: 34px;
-  height: 34px;
-  border-radius: 11px;
-  background: var(--grad);
-  display: grid;
-  place-items: center;
-  color: #fff;
-  box-shadow: 0 6px 18px rgba(109, 93, 252, 0.4);
-}
 .nav {
   display: flex;
   gap: 11px;
@@ -415,6 +405,25 @@ kbd {
 }
 .dot.sleeping {
   background: #7c8bd6;
+}
+.dot.downloading {
+  background: var(--accent);
+  animation: blink 1.2s ease-in-out infinite;
+}
+/* A thin bar under the engine status while a speech model downloads. */
+.chip-progress {
+  display: block;
+  height: 3px;
+  margin-top: 6px;
+  border-radius: 99px;
+  background: var(--border);
+  overflow: hidden;
+}
+.chip-progress > span {
+  display: block;
+  height: 100%;
+  background: var(--grad);
+  transition: width 0.4s var(--ease);
 }
 .dot.error {
   background: var(--danger);
@@ -787,33 +796,7 @@ button.danger-solid:hover:not(:disabled) {
   color: var(--muted);
 }
 
-.commands-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
-  gap: 10px;
-}
-.command-tile {
-  padding: 12px 14px;
-  border-radius: 12px;
-  background: var(--surface-sunken);
-  border: 1px solid var(--border);
-}
-.command-say {
-  font-weight: 650;
-}
-.command-say .name {
-  color: var(--accent);
-}
 
-.split-2 {
-  display: grid;
-  grid-template-columns: 1.3fr 1fr;
-  gap: 16px;
-  margin-top: 16px;
-}
-.split-2 > .card {
-  margin-top: 0;
-}
 
 .compact-row {
   display: grid;
@@ -1224,22 +1207,15 @@ button.danger-solid:hover:not(:disabled) {
   font-size: 12.5px;
   padding-top: 1px;
 }
-.error-box,
-.warn-box {
+.error-box {
   margin: 14px 0;
   padding: 11px 14px;
   border-radius: 12px;
   font-size: 13px;
   white-space: pre-wrap;
-}
-.error-box {
   background: rgba(229, 72, 77, 0.08);
   border: 1px solid rgba(229, 72, 77, 0.3);
   color: var(--danger);
-}
-.warn-box {
-  background: rgba(232, 161, 58, 0.1);
-  border: 1px solid rgba(232, 161, 58, 0.3);
 }
 
 /* Settings ------------------------------------------------------------------ */
@@ -1270,6 +1246,11 @@ button.danger-solid:hover:not(:disabled) {
   align-items: flex-start;
   gap: 12px;
   cursor: pointer;
+  border-radius: 10px;
+}
+.toggle-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
 }
 .switch {
   width: 38px;
@@ -1338,8 +1319,9 @@ button.danger-solid:hover:not(:disabled) {
   color: #fff;
   box-shadow: 0 2px 10px rgba(109, 93, 252, 0.35);
 }
-.capturing {
-  border-color: var(--accent) !important;
+/* The shortcut box while it waits for keys (not the overlay's red .capturing theme). */
+.hotkey-input.capturing {
+  border-color: var(--accent);
   color: var(--accent);
 }
 .checklist {
@@ -1404,6 +1386,43 @@ button.danger-solid:hover:not(:disabled) {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* Settings: headings inside a card's grid, and the collapsible Advanced card. */
+.settings-grid h3.settings-sub {
+  margin: 10px 0 -4px;
+}
+.settings-grid h3.settings-sub:first-child {
+  margin-top: 0;
+}
+button.collapse-head {
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  box-shadow: none;
+  text-align: left;
+  white-space: normal;
+}
+button.collapse-head:hover:not(:disabled),
+button.collapse-head:active:not(:disabled) {
+  border: none;
+  background: transparent;
+  transform: none;
+}
+button.collapse-head:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+}
+button.collapse-head[aria-expanded="true"] {
+  margin-bottom: 14px;
+}
+.collapse-chevron {
+  color: var(--muted);
+  transition: transform 0.2s var(--ease);
+}
+.collapse-chevron.open {
+  transform: rotate(180deg);
 }
 .save-bar {
   position: sticky;
@@ -1548,24 +1567,6 @@ html.overlay-root .app::before {
 .stopping {
   --c1: #7d84a8;
   --c2: #c4c9e4;
-}
-.ov-logo-wrap {
-  position: relative;
-  width: 34px;
-  height: 34px;
-  display: grid;
-  place-items: center;
-  flex-shrink: 0;
-}
-.ov-logo {
-  position: relative;
-  width: 34px;
-  height: 34px;
-  border-radius: 50%;
-  display: grid;
-  place-items: center;
-  background: linear-gradient(135deg, var(--c1), var(--c2));
-  box-shadow: 0 3px 12px rgba(0, 0, 0, 0.35);
 }
 .ov-ring {
   position: absolute;
@@ -1884,4 +1885,226 @@ button.badge-link:disabled {
   .meeting-actions > .grow {
     display: none;
   }
+}
+/* Settings: downloaded models. */
+.model-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 6px;
+}
+.model-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  font-size: 13px;
+}
+.model-row:hover {
+  background: var(--surface-sunken);
+}
+/* Settings: speech / task model choice, with what each uses on this computer. */
+.model-options {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 6px 0 4px;
+}
+.model-option {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  width: 100%;
+  padding: 9px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.model-option:hover {
+  background: var(--surface-sunken);
+}
+.model-option.on {
+  border-color: var(--accent);
+  background: var(--grad-soft);
+}
+.model-option-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+.model-option-title .faint {
+  font-weight: 400;
+}
+.model-option-specs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  font-size: 12px;
+  color: var(--muted);
+}
+/* Transcript: rename speakers, fix lines. */
+.seg {
+  position: relative;
+}
+.seg-speaker-btn {
+  all: unset;
+  font-weight: 650;
+  font-size: 12.5px;
+  padding-top: 1px;
+  cursor: pointer;
+  text-decoration: underline dotted transparent;
+  text-underline-offset: 3px;
+  transition: text-decoration-color 0.15s;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.seg-speaker-btn:hover,
+.seg-speaker-btn:focus-visible {
+  text-decoration-color: currentColor;
+}
+.seg-edit-btn {
+  position: absolute;
+  top: 3px;
+  right: 4px;
+  opacity: 0;
+  padding: 4px;
+  transition: opacity 0.15s;
+}
+.seg:hover .seg-edit-btn,
+.seg-edit-btn:focus-visible {
+  opacity: 1;
+}
+.seg-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.seg-edit textarea {
+  width: 100%;
+  resize: vertical;
+  font: inherit;
+  line-height: 1.55;
+}
+.seg.editing {
+  cursor: default;
+  background: var(--surface-strong);
+}
+.rename-speaker {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  border-radius: 12px;
+  background: var(--surface-strong);
+  border: 1px solid var(--border-strong);
+}
+.rename-speaker input[type="text"],
+.rename-speaker input:not([type]) {
+  flex: 1;
+  min-width: 140px;
+}
+/* Search */
+.search-box {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  margin-bottom: 18px;
+  color: var(--muted);
+}
+.search-box input {
+  border: none;
+  background: transparent;
+  font-size: 15px;
+  padding: 4px 0;
+}
+.search-box input:focus {
+  outline: none;
+  box-shadow: none;
+}
+.search-hit {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 12px 14px;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+.search-title {
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.search-snippet {
+  margin-top: 4px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.search-snippet mark {
+  background: var(--grad-soft);
+  color: var(--accent);
+  border-radius: 4px;
+  padding: 0 2px;
+}
+
+/* CPU only: the window is drawn by the CPU. Same look, without motion or blur
+   (those kept ~1.3 cores busy while idle). See src/lite.ts. */
+html.lite .app::before,
+html.lite .ov-bar::before,
+html.lite .ov-mini::before {
+  animation: none;
+}
+html.lite *,
+html.lite *::before,
+html.lite *::after {
+  backdrop-filter: none !important;
+}
+html.lite .card,
+html.lite .sidebar,
+html.lite .dialog {
+  background: var(--surface-strong);
+}
+/* Hidden or minimised: nothing to animate. */
+html.paused *,
+html.paused *::before,
+html.paused *::after {
+  animation-play-state: paused !important;
+}
+/* Settings: first-run download. */
+.getting-ready {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+  margin-bottom: 8px;
+  border-radius: 12px;
+  background: var(--grad-soft);
+  border: 1px solid var(--border-strong);
+}
+.getting-ready p {
+  margin: 0;
+}
+.getting-ready-list {
+  margin: 0;
+  padding-left: 18px;
+}
+.getting-ready-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }

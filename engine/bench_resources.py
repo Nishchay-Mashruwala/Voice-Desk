@@ -1,7 +1,7 @@
 """How much RAM, CPU and GPU memory each Voice Desk job uses on this computer.
 
 Runs the speech engine the way the app does (a subprocess speaking JSON lines)
-on a meeting recording, then asks the task AI (Ollama) about its transcript,
+on a meeting recording, then asks the task AI (llama-server) about its transcript,
 sampling resources 4 times a second. Prints one row per job.
 
   .venv/Scripts/python engine/bench_resources.py MIC.wav SYSTEM.wav [--device auto|cuda|cpu]
@@ -207,33 +207,38 @@ def row(r: dict, gpu_ok: bool) -> str:
             f"{r['cpu_avg']:5.1f} cores {r['cpu_peak']:5.1f} cores")
 
 
-def ensure_ollama(url: str, env: dict) -> None:
-    """Start `ollama serve` like the app does (restarting it so `env` applies)."""
-    for p in ollama_procs():
-        try:
-            p.kill()
-        except psutil.Error:
-            pass
-    time.sleep(2)
+def voicedesk_dir() -> str:
+    if sys.platform == "win32":
+        return os.path.join(os.environ.get("LOCALAPPDATA", ""), "VoiceDesk")
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Caches/VoiceDesk")
+    return os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "voicedesk")
+
+
+def start_task_ai(model_file: str, ctx: int, device: str) -> tuple[subprocess.Popen, str]:
+    """Start llama-server the way the app does (llm.rs `server_args`)."""
+    import glob
+
+    exe = "llama-server.exe" if sys.platform == "win32" else "llama-server"
+    found = glob.glob(os.path.join(voicedesk_dir(), "llama", "*", exe))
+    model = os.path.join(voicedesk_dir(), "models", model_file)
+    if not found or not os.path.exists(model):
+        raise RuntimeError("The task AI isn't downloaded: Settings -> Setup -> Download in Voice Desk")
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    threads = max(2, (psutil.cpu_count(logical=False) or 4) // 2)
+    args = [found[0], "-m", model, "--host", "127.0.0.1", "--port", str(port), "-c", str(ctx), "-np", "1",
+            "-t", str(threads), "--jinja", "--no-webui", "-fa", "on", "--cache-type-k", "q8_0",
+            "--cache-type-v", "q8_0", "-ngl", "0" if device == "cpu" else "99"]
+    if device == "cpu":
+        args += ["--device", "none"]
     flags = 0x08000000 if sys.platform == "win32" else 0
-    subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags,
-                     env={**os.environ, **env})
-    for _ in range(60):
-        time.sleep(0.5)
-        try:
-            urllib.request.urlopen(f"{url}/api/tags", timeout=3).read()
-            return
-        except Exception:  # noqa: BLE001
-            pass
-    raise RuntimeError("Ollama didn't start")
-
-
-def ollama_procs() -> list[psutil.Process]:
-    out = []
-    for p in psutil.process_iter(["name"]):
-        if "ollama" in (p.info["name"] or "").lower():
-            out.append(p)
-    return out
+    proc = subprocess.Popen(args, cwd=os.path.dirname(found[0]), stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, creationflags=flags)
+    return proc, f"http://127.0.0.1:{port}"
 
 
 def main() -> None:
@@ -244,12 +249,10 @@ def main() -> None:
     ap.add_argument("--dictation-s", type=float, default=30.0)
     ap.add_argument("--skip-llm", action="store_true")
     ap.add_argument("--llm-only", action="store_true", help="only the task AI step, on the longest saved meeting")
-    ap.add_argument("--profile", choices=["before", "after"], default="after",
-                    help="the task AI request as the app sent it before/after the memory changes")
     a = ap.parse_args()
 
     s = app_settings()
-    device = a.device or s.get("whisper_device", "auto")
+    device = a.device or s.get("device") or s.get("whisper_device", "auto")
     langs = s.get("languages") or [s.get("language") or "en"]
     translate = {"all": True, "gujarati": ["gu"]}.get(s.get("translate", "gujarati"), False)
     common = {"model": s.get("whisper_model", "auto"), "device": device, "languages": langs,
@@ -343,42 +346,41 @@ def context_for(prompt: str) -> int:
 
 
 def bench_llm(a, s: dict, device: str, segments: list[dict], gpu: Gpu, meter: Meter) -> None:
+    """Finding tasks as the app does it: start llama-server sized to the
+    transcript, ask once, stop (so the time includes loading the model)."""
     transcript = "\n".join(f"{x['speaker']}: {x['text']}" for x in segments)
     user = (f"The user is {s.get('user_name') or 'the user'}.\nTranscript:\n\"\"\"\n{transcript}\n\"\"\"\n\n"
             "Extract the user's action items and summarize.")
-    model = s.get("llm_model", "qwen3:4b")
-    url = (s.get("ollama_url") or "http://127.0.0.1:11434").rstrip("/")
-    if a.profile == "before":
-        opts, env = {"temperature": 0.1, "num_ctx": 8192}, {}
-    else:
-        opts = {"temperature": 0.1, "num_ctx": context_for(SYSTEM + user), "num_predict": 1536,
-                "num_thread": max(2, psutil.cpu_count(logical=False) // 2)}
-        env = {"OLLAMA_FLASH_ATTENTION": "1", "OLLAMA_KV_CACHE_TYPE": "q8_0"}
-    if device == "cpu":
-        opts["num_gpu"] = 0
-    print(f"  (task AI, {a.profile}: {opts})", flush=True)
-    ensure_ollama(url, env)
-    time.sleep(2)
-    body = {"model": model, "stream": False, "think": False, "keep_alive": 0, "format": SCHEMA, "options": opts,
-            "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}]}
+    choice = s.get("llm_model", "auto")
+    ram = psutil.virtual_memory().total / 1e9
+    small = choice == "qwen3-1.7b" or (choice not in ("qwen3-4b",) and ram < 6)
+    model_file = "Qwen3-1.7B-Q4_K_M.gguf" if small else "Qwen3-4B-Q4_K_M.gguf"
+    ctx = context_for(SYSTEM + user)
+    print(f"  (task AI: {model_file}, context {ctx}, {'CPU' if device == 'cpu' else 'GPU if any'})", flush=True)
     meter.gpu_base = gpu.mem_mb
-    meter.start(f"Finding tasks ({model})", ollama_procs())
-    req = urllib.request.Request(f"{url}/api/chat", json.dumps(body).encode(), {"Content-Type": "application/json"})
-
-    def refresh() -> None:  # the model runner starts after the request
-        while meter.job:
-            time.sleep(0.5)
-            with meter.lock:
-                meter.procs = ollama_procs()
-
-    threading.Thread(target=refresh, daemon=True).start()
+    proc, url = start_task_ai(model_file, ctx, device)
+    meter.start(f"Finding tasks ({model_file.split('-Q')[0]})", [psutil.Process(proc.pid)])
     try:
+        for _ in range(240):
+            time.sleep(0.5)
+            try:
+                urllib.request.urlopen(f"{url}/health", timeout=2).read()
+                break
+            except Exception:  # noqa: BLE001
+                pass
+        body = {"messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}],
+                "temperature": 0.1, "max_tokens": 1536,
+                "response_format": {"type": "json_schema", "json_schema": {"name": "tasks", "schema": SCHEMA}},
+                "chat_template_kwargs": {"enable_thinking": False}}
+        req = urllib.request.Request(f"{url}/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
         out = json.loads(urllib.request.urlopen(req, timeout=900).read())
-        tasks = json.loads(out["message"]["content"]).get("tasks", [])
-        print(f"  ({len(tasks)} tasks, {out.get('eval_count')} tokens written)", flush=True)
+        tasks = json.loads(out["choices"][0]["message"]["content"]).get("tasks", [])
+        print(f"  ({len(tasks)} tasks, {out.get('usage', {}).get('completion_tokens')} tokens written)", flush=True)
     except Exception as e:  # noqa: BLE001
         print(f"  task AI failed: {e}")
-    meter.stop()
+    finally:
+        meter.stop()
+        proc.kill()
 
 
 if __name__ == "__main__":

@@ -1,6 +1,11 @@
 """Run: python engine/test_commands.py"""
 
-from commands import is_bare_command, parse
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from commands import is_bare_command, parse  # noqa: E402
 
 CMDS = {
     "stop": "stop",
@@ -71,8 +76,70 @@ def main() -> None:
         if is_bare_command(text, CMDS) != bare:
             failed += 1
             print(f"FAIL is_bare_command({text!r}) != {bare}")
-    print(f"{len(CASES) - failed}/{len(CASES)} parse cases passed" if failed else f"all {len(CASES) + 4} passed")
+    for check in (check_collapse_repeats, check_echoes_vocabulary, check_idle_watchdog):
+        try:
+            check()
+        except AssertionError as e:
+            failed += 1
+            print(f"FAIL {check.__name__}: {e}")
+    total = len(CASES) + 4 + 3
+    print(f"{total - failed}/{total} passed" if failed else f"all {total} passed")
     raise SystemExit(1 if failed else 0)
+
+
+def check_collapse_repeats() -> None:
+    from speech import collapse_repeats
+
+    for text, expected in [
+        ("I don't know, I don't know, I don't know.", "I don't know."),
+        ("Hello, hello, hello", "Hello, hello, hello"),  # a word 3 times is kept
+        ("no no no no no", "no"),
+        ("હા હા હા હા હા છે", "હા છે"),
+        ("Send it today.", "Send it today."),
+        ("", ""),
+    ]:
+        assert collapse_repeats(text) == expected, (text, collapse_repeats(text))
+
+
+def check_echoes_vocabulary() -> None:
+    from speech import echoes_vocabulary
+
+    vocab = "Jarvis, Priya, Voice Desk"
+    assert echoes_vocabulary("Priya, Voice Desk.", vocab)
+    assert not echoes_vocabulary("Send the report to Priya.", vocab)
+    assert not echoes_vocabulary("Priya", vocab)  # one word: too little to tell
+    assert not echoes_vocabulary("Priya, Voice Desk.", None)
+
+
+def check_idle_watchdog() -> None:
+    """The engine only exits when idle: not while a request (a long meeting)
+    is running, or dictation is on, however long ago Whisper was last used."""
+    import time
+
+    import engine
+
+    saved = engine.idle_unload_s, engine.busy, engine.last_done, engine.transcriber.model, engine.transcriber.last_used
+    try:
+        now = time.time()
+        engine.idle_unload_s = 600
+        engine.transcriber.model = object()  # loaded
+        engine.transcriber.last_used = engine.last_done = now - 700
+        engine.busy = 1
+        assert not engine.idle_too_long(now), "exited during a request"
+        engine.busy = 0
+        assert engine.idle_too_long(now)
+        engine.last_done = now - 60  # a request just ended
+        assert not engine.idle_too_long(now), "exited right after a request"
+        engine.last_done = now - 700
+        engine.streams[-1] = None  # dictation on
+        assert not engine.idle_too_long(now), "exited while dictating"
+        del engine.streams[-1]
+        engine.idle_unload_s = 0  # "never unload"
+        assert not engine.idle_too_long(now)
+    finally:
+        engine.streams.pop(-1, None)
+        (engine.idle_unload_s, engine.busy, engine.last_done, engine.transcriber.model,
+         engine.transcriber.last_used) = saved
 
 
 if __name__ == "__main__":

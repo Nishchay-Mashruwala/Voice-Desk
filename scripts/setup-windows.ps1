@@ -3,7 +3,7 @@
   Double-click "Setup Voice Desk (Windows).bat" in the project folder, or run:
     powershell -ExecutionPolicy Bypass -File scripts\setup-windows.ps1
 
-  Installs anything missing (Node.js, Rust, C++ build tools, Ollama, uv), sets up
+  Installs anything missing (Node.js, Rust, C++ build tools, uv), sets up
   the Python speech engine, downloads the AI models, builds Voice Desk, and
   puts a "Voice Desk" shortcut on your Desktop and in the Start menu.
   Safe to run again: finished steps are skipped.
@@ -11,7 +11,7 @@
 param(
   [switch]$NoShortcut,
   [switch]$SkipBuild,
-  [switch]$KeepOllamaAutostart
+  [switch]$Indic  # also install Hindi/Gujarati support (PyTorch, ~0.7 GB)
 )
 
 $ErrorActionPreference = "Stop"
@@ -61,18 +61,8 @@ if ($hasMsvc) { Ok "C++ build tools" } else {
 }
 
 # ---------------------------------------------------------------------------
-Step 2 "Ollama (runs the task AI)"
-$ollama = Join-Path $env:LOCALAPPDATA "Programs\Ollama\ollama.exe"
-if ((Has "ollama") -or (Test-Path $ollama)) { Ok "Ollama installed" } else { Winget-Install "Ollama.Ollama" "Ollama" }
-if (-not (Has "ollama") -and (Test-Path $ollama)) { $env:Path += ";" + (Split-Path $ollama) }
-# Voice Desk starts Ollama when it opens and stops it when it closes, so Ollama
-# doesn't need to launch at login. (Re-enable: move the shortcut back.)
-$startupLink = Join-Path ([Environment]::GetFolderPath("Startup")) "Ollama.lnk"
-if ((Test-Path $startupLink) -and -not $KeepOllamaAutostart) {
-  $backup = Join-Path $env:LOCALAPPDATA "Programs\Ollama\Ollama-startup.lnk.disabled"
-  Move-Item $startupLink $backup -Force
-  Info "Ollama no longer starts at login; Voice Desk starts it when needed (backup: $backup)."
-}
+Step 2 "Task AI"
+Info "Nothing to install: Voice Desk downloads its task AI (llama.cpp + Qwen3) itself, from Settings -> Setup."
 
 # ---------------------------------------------------------------------------
 Step 3 "Python speech engine"
@@ -90,8 +80,23 @@ if (-not $engineOk) {
   }
 }
 Info "Installing speech packages (first time: a few minutes)..."
-if (Has "uv") { uv pip install --python $Py -r engine\requirements.txt } else { & $Py -m pip install -q -r engine\requirements.txt }
-if ($LASTEXITCODE -ne 0) { Fail "Installing the speech packages failed." }
+# engine\constraints.txt pins the exact, tested versions (see README -> Releases).
+function PipInstall($file, $extra) {
+  $pin = @("-c", "engine\constraints.txt")
+  # Like pip, let uv take each package from whichever index has the pinned version.
+  $uvx = if ($extra -contains "--index-url") { @("--index-strategy", "unsafe-best-match") } else { @() }
+  if (Has "uv") { uv pip install --python $Py -r $file @pin @extra @uvx } else { & $Py -m pip install -q -r $file @pin @extra }
+  if ($LASTEXITCODE -ne 0) { Fail "Installing $file failed." }
+}
+PipInstall "engine\requirements.txt" @()
+if (Has "nvidia-smi") {
+  Info "NVIDIA GPU found: adding GPU speed-up (~2 GB)..."
+  PipInstall "engine\requirements-nvidia.txt" @()
+}
+if ($Indic) {
+  Info "Adding Hindi/Gujarati support (~0.7 GB)..."
+  PipInstall "engine\requirements-indic.txt" @("--index-url", "https://download.pytorch.org/whl/cpu", "--extra-index-url", "https://pypi.org/simple")
+}
 Ok "Speech engine ready"
 
 # ---------------------------------------------------------------------------
@@ -100,16 +105,8 @@ Step 4 "Speech models"
 if ($LASTEXITCODE -ne 0) { Fail "Downloading speech models failed. Check your internet connection." }
 
 # ---------------------------------------------------------------------------
-Step 5 "Task AI model (Qwen3 4B, about 2.5 GB)"
-$ollamaCmd = if (Has "ollama") { "ollama" } else { $ollama }
-try { Invoke-RestMethod http://127.0.0.1:11434/api/tags -TimeoutSec 3 | Out-Null } catch {
-  Info "Starting Ollama..."
-  Start-Process $ollamaCmd -ArgumentList "serve" -WindowStyle Hidden
-  Start-Sleep 5
-}
-& $ollamaCmd pull qwen3:4b
-if ($LASTEXITCODE -ne 0) { Fail "Downloading the task AI model failed." }
-Ok "Task AI ready"
+Step 5 "Task AI model"
+Info "Downloaded by Voice Desk on first start (Settings -> Setup -> Download): Qwen3 4B, about 2.5 GB."
 
 # ---------------------------------------------------------------------------
 Step 6 "Building Voice Desk"

@@ -172,9 +172,15 @@ function MeetingDetail({
   const processing = meeting.status === "transcribing" || meeting.status === "extracting";
 
   const rename = async () => {
-    if (title.trim() && title !== meeting.title) {
+    // An empty title isn't allowed: put the old one back.
+    if (!title.trim()) return setTitle(meeting.title);
+    if (title === meeting.title) return;
+    try {
       await api.renameMeeting(meeting.id, title.trim());
       onChange();
+    } catch (e) {
+      toast(`Couldn't rename: ${e}`);
+      setTitle(meeting.title);
     }
   };
   const [moving, setMoving] = useState(false);
@@ -250,7 +256,15 @@ function MeetingDetail({
       {meeting.status !== "recording" && !processing && (
         <>
           <h3>Recording &amp; transcript</h3>
-          <MeetingPlayer meetingId={meeting.id} segments={segments} durationS={meeting.duration_s ?? 0} tasks={tasks} focus={focus} />
+          <MeetingPlayer
+            meetingId={meeting.id}
+            segments={segments}
+            durationS={meeting.duration_s ?? 0}
+            tasks={tasks}
+            focus={focus}
+            onEdited={() => api.getTranscript(meeting.id).then(setSegments)}
+            onFindTasks={() => reprocess(false)}
+          />
         </>
       )}
 

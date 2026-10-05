@@ -1,6 +1,7 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
-import { api, formatDuration, type Segment, type SourceFocus, type Word } from "../api";
-import { Pause, Play } from "../icons";
+import { api, audioBlob, formatDuration, type Segment, type SourceFocus, type Word } from "../api";
+import { Pencil, Pause, Play } from "../icons";
+import { retimeWords } from "../retime";
 import { quoteStart, taskOfWords, type TaskMark } from "../taskMarks";
 import { toast } from "../toast";
 
@@ -22,6 +23,12 @@ function spreadWords(s: Segment): Word[] {
 
 type LineState = "" | "now" | "spoken" | "upcoming";
 
+type LineAction =
+  | { kind: "edit"; index: number }
+  | { kind: "save"; index: number; text: string }
+  | { kind: "cancel" }
+  | { kind: "rename"; speaker: string };
+
 /**
  * One transcript line. Memoised: while playing, only the current line gets a
  * new `time` (the others get a fixed one), so an hour-long meeting doesn't
@@ -34,7 +41,9 @@ const Line = memo(function Line({
   taskOf,
   state,
   time,
+  editing,
   onSeek,
+  onAction,
 }: {
   seg: Segment;
   index: number;
@@ -42,12 +51,69 @@ const Line = memo(function Line({
   taskOf: (string | null)[];
   state: LineState;
   time: number;
+  editing: boolean;
   onSeek: (t: number) => void;
+  onAction: (a: LineAction) => void;
 }) {
+  const [draft, setDraft] = useState(seg.text);
+  useEffect(() => setDraft(seg.text), [seg.text, editing]);
+  if (editing) {
+    const save = () => onAction({ kind: "save", index, text: draft });
+    return (
+      <div data-seg={index} className={`seg editing ${seg.speaker === "Me" ? "me" : ""}`}>
+        <span className="seg-time">{formatDuration(seg.start)}</span>
+        <span className="seg-speaker">{seg.speaker}</span>
+        <div className="seg-edit">
+          <textarea
+            autoFocus
+            value={draft}
+            rows={Math.min(6, Math.ceil(draft.length / 70) + 1)}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                save();
+              }
+              if (e.key === "Escape") onAction({ kind: "cancel" });
+            }}
+          />
+          <div className="row">
+            <button className="primary" onClick={save} disabled={!draft.trim()}>
+              Save
+            </button>
+            <button onClick={() => onAction({ kind: "cancel" })}>Cancel</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
   return (
     <div data-seg={index} className={`seg ${seg.speaker === "Me" ? "me" : ""} ${state}`} onClick={() => onSeek(seg.start)}>
       <span className="seg-time">{formatDuration(seg.start)}</span>
-      <span className="seg-speaker">{seg.speaker}</span>
+      {seg.speaker === "Me" ? (
+        <span className="seg-speaker">{seg.speaker}</span>
+      ) : (
+        <button
+          className="seg-speaker seg-speaker-btn"
+          title="Rename this speaker"
+          onClick={(e) => {
+            e.stopPropagation();
+            onAction({ kind: "rename", speaker: seg.speaker });
+          }}
+        >
+          {seg.speaker}
+        </button>
+      )}
+      <button
+        className="ghost icon seg-edit-btn"
+        title="Fix the words in this line"
+        onClick={(e) => {
+          e.stopPropagation();
+          onAction({ kind: "edit", index });
+        }}
+      >
+        <Pencil size={13} />
+      </button>
       <span className={`seg-text karaoke ${state === "now" || state === "spoken" ? "" : "idle"}`}>
         {words.map((w, i) => {
           const ws = state === "now" ? (time >= w.e ? "spoken" : time >= w.s ? "now" : "") : state === "spoken" ? "spoken" : "";
@@ -83,11 +149,17 @@ export default function MeetingPlayer({
   durationS,
   tasks = [],
   focus,
+  onEdited,
+  onFindTasks,
 }: {
   meetingId: number;
   segments: Segment[];
   durationS: number;
   tasks?: TaskMark[];
+  /** A line or speaker name changed (reload the transcript). */
+  onEdited?: () => void;
+  /** Offered after renaming, so tasks use the new name. */
+  onFindTasks?: () => void;
   /** Play from just before where a task was said. */
   focus?: SourceFocus;
 }) {
@@ -102,13 +174,19 @@ export default function MeetingPlayer({
   const [loading, setLoading] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
 
+  // Bumped when the meeting changes or the player closes: audio still loading
+  // for the old one is then dropped instead of created and played.
+  const gen = useRef(0);
   useEffect(() => {
+    const mine = ++gen.current;
     setTracksKnown(false);
     api.meetingTracks(meetingId).then((t) => {
+      if (gen.current !== mine) return;
       setAvailable(t);
       setTracksKnown(true);
     });
     return () => {
+      gen.current++;
       Object.values(audios.current).forEach((a) => a?.pause());
       urls.current.forEach((u) => URL.revokeObjectURL(u));
       audios.current = {};
@@ -139,11 +217,13 @@ export default function MeetingPlayer({
 
   const load = async () => {
     if (Object.keys(audios.current).length) return true;
+    const mine = gen.current;
     setLoading(true);
     try {
       for (const t of tracks) {
         const bytes = await api.meetingAudio(meetingId, t);
-        const url = URL.createObjectURL(new Blob([bytes], { type: "audio/wav" }));
+        if (gen.current !== mine) return false;
+        const url = URL.createObjectURL(audioBlob(bytes));
         urls.current.push(url);
         const a = new Audio(url);
         a.muted = muted[t];
@@ -168,7 +248,7 @@ export default function MeetingPlayer({
     } catch {
       return false;
     } finally {
-      setLoading(false);
+      if (gen.current === mine) setLoading(false);
     }
   };
 
@@ -221,13 +301,59 @@ export default function MeetingPlayer({
   };
   const onSeek = useMemo(() => (t: number) => seekTo.current(t), []);
 
+  // Fixing a line's words, and renaming a speaker.
+  const [editing, setEditing] = useState<number | null>(null);
+  const [renaming, setRenaming] = useState<string | null>(null);
+  const [newName, setNewName] = useState("");
+  const [remember, setRemember] = useState(true);
+  const [savingName, setSavingName] = useState(false);
+  const act = useRef<(a: LineAction) => void>(() => {});
+  act.current = async (a: LineAction) => {
+    if (a.kind === "edit") setEditing(a.index);
+    if (a.kind === "cancel") setEditing(null);
+    if (a.kind === "rename") {
+      setRenaming(a.speaker);
+      setNewName(/^Speaker \d+$|^Others$/.test(a.speaker) ? "" : a.speaker);
+    }
+    if (a.kind === "save") {
+      const seg = segments[a.index];
+      const text = a.text.trim();
+      if (!seg || !text) return;
+      try {
+        await api.updateTranscriptLine(meetingId, a.index, text, retimeWords(lines[a.index].words, text, seg.start, seg.end));
+        setEditing(null);
+        onEdited?.();
+      } catch (e) {
+        toast(`Couldn't save: ${e}`);
+      }
+    }
+  };
+  const onAction = useMemo(() => (a: LineAction) => act.current(a), []);
+  const saveName = async () => {
+    if (!renaming || !newName.trim()) return;
+    setSavingName(true);
+    try {
+      await api.renameSpeaker(meetingId, renaming, newName.trim(), remember);
+      toast(
+        remember ? `Renamed — ${newName.trim()}'s voice will be recognised in future meetings` : `Renamed to ${newName.trim()}`,
+        onFindTasks ? { action: { label: "Find tasks again", run: onFindTasks } } : {},
+      );
+      setRenaming(null);
+      onEdited?.();
+    } catch (e) {
+      toast(String(e));
+    } finally {
+      setSavingName(false);
+    }
+  };
+
   // Opened from a task: start a little before its quote (once the transcript is in).
   const focused = useRef<number | null>(null);
   useEffect(() => {
     if (!focus?.play || focused.current === focus.nonce || segments.length === 0 || !tracksKnown) return;
     focused.current = focus.nonce;
-    const at = quoteStart(lines.flatMap((l) => l.words), focus.quote);
-    if (at === null) toast("Couldn't find where this task was said — playing from the start");
+    const at = focus.atS ?? quoteStart(lines.flatMap((l) => l.words), focus.quote);
+    if (at === null && focus.quote) toast("Couldn't find where this task was said — playing from the start");
     if (!tracks.length) {
       toast("The audio for this meeting is no longer available");
       return;
@@ -277,6 +403,31 @@ export default function MeetingPlayer({
         </p>
       )}
 
+      {renaming && (
+        <div className="rename-speaker">
+          <span className="small">
+            Rename <b>{renaming}</b> to
+          </span>
+          <input
+            autoFocus
+            value={newName}
+            placeholder="Their name"
+            onChange={(e) => setNewName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") saveName();
+              if (e.key === "Escape") setRenaming(null);
+            }}
+          />
+          <label className="small row" title="Their voice is saved on this computer only">
+            <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} />
+            Recognise this voice in future meetings
+          </label>
+          <button className="primary" onClick={saveName} disabled={!newName.trim() || savingName}>
+            {savingName ? <span className="spinner" /> : "Rename"}
+          </button>
+          <button onClick={() => setRenaming(null)}>Cancel</button>
+        </div>
+      )}
       {segments.length > 0 && (
         <div className="transcript" ref={listRef}>
           {segments.map((s, i) => {
@@ -290,7 +441,9 @@ export default function MeetingPlayer({
                 taskOf={lines[i].taskOf}
                 state={state}
                 time={state === "now" ? time : 0}
+                editing={editing === i}
                 onSeek={onSeek}
+                onAction={onAction}
               />
             );
           })}

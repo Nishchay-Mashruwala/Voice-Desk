@@ -24,6 +24,7 @@
       },
       {
         "label": "overlay",
+        "title": "",
         "url": "index.html#overlay",
         "width": 214,
         "height": 58,
@@ -65,6 +66,36 @@
           "libpipewire-0.3-0",
           "libasound2"
         ]
+      }
+    },
+    "resources": {
+      "../engine/commands.py": "engine/commands.py",
+      "../engine/engine.py": "engine/engine.py",
+      "../engine/indic.py": "engine/indic.py",
+      "../engine/meeting.py": "engine/meeting.py",
+      "../engine/mixed.py": "engine/mixed.py",
+      "../engine/recordings.py": "engine/recordings.py",
+      "../engine/runtime.py": "engine/runtime.py",
+      "../engine/speakers.py": "engine/speakers.py",
+      "../engine/speech.py": "engine/speech.py",
+      "../engine/stream.py": "engine/stream.py",
+      "../engine/transcriber.py": "engine/transcriber.py",
+      "../engine/voice.py": "engine/voice.py",
+      "../engine/voiceprint.py": "engine/voiceprint.py",
+      "../engine/requirements*.txt": "engine/",
+      "../engine/constraints.txt": "engine/constraints.txt",
+      "../engine/english-words.txt": "engine/english-words.txt"
+    },
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDEzRjg4MTk5NzUzQ0U1QkUKUldTKzVUeDFtWUg0RTJmTDBjWm9ZaDNjOXVLNHFMeDRlZ0srNGMzbEdmS1FkNjZXdW5wVU92Y1cK",
+      "endpoints": [
+        "https://github.com/Nishchay-Mashruwala/Voice-Desk/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
       }
     }
   }

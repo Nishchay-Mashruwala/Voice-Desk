@@ -4,7 +4,7 @@ export type TaskMark = { description: string; quote: string | null };
 
 // Compare words ignoring case and punctuation. Marks (\p{M}) are kept so
 // Hindi/Gujarati vowel signs still count.
-const norm = (w: string) => w.toLowerCase().replace(/[^\p{L}\p{M}\p{N}]/gu, "");
+export const norm = (w: string) => w.toLowerCase().replace(/[^\p{L}\p{M}\p{N}]/gu, "");
 
 /** A quote's words. The task AI sometimes keeps the transcript's "Name:" in front; drop it. */
 function quoteTokens(quote: string | null): string[] {

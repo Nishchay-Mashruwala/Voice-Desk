@@ -41,8 +41,12 @@ function TaskRow({
     setEditing(false);
   };
   const copy = async () => {
-    await navigator.clipboard.writeText(task.description);
-    toast("Task copied");
+    try {
+      await navigator.clipboard.writeText(task.description);
+      toast("Task copied");
+    } catch (e) {
+      toast(`Couldn't copy: ${e}`);
+    }
   };
   const keys = (e: React.KeyboardEvent) => {
     if (e.key === "Enter") save();
@@ -152,12 +156,21 @@ export function TaskList({
 
   const toggle = async (t: Task) => {
     setTasks((prev) => prev.map((x) => (x.id === t.id ? { ...x, done: !x.done } : x)));
-    await api.setTaskDone(t.id, !t.done);
-    load();
+    try {
+      await api.setTaskDone(t.id, !t.done);
+    } catch (e) {
+      toast(`Couldn't update the task: ${e}`);
+    }
+    load(); // also undoes the optimistic change if it failed
   };
   const save = async (t: Task, description: string, due: string | null) => {
     setTasks((prev) => prev.map((x) => (x.id === t.id ? { ...x, description, due } : x)));
-    await api.updateTask(t.id, description, due);
+    try {
+      await api.updateTask(t.id, description, due);
+    } catch (e) {
+      toast(`Couldn't save the task: ${e}`);
+      load();
+    }
   };
   const remove = async (t: Task) => {
     const ok = await confirmDialog({ title: "Delete this task?", message: `“${t.description}”` });
@@ -176,9 +189,13 @@ export function TaskList({
   };
   const add = async () => {
     if (!draft.trim()) return;
-    await api.addTask(meetingId, draft.trim(), null);
-    setDraft("");
-    load();
+    try {
+      await api.addTask(meetingId, draft.trim(), null);
+      setDraft("");
+      load();
+    } catch (e) {
+      toast(`Couldn't add the task: ${e}`); // the draft stays, to try again
+    }
   };
 
   // Drag & drop: reorder live while dragging, save on drop.

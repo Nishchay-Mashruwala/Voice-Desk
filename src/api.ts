@@ -24,15 +24,16 @@ export interface Settings {
   translate: "none" | "gujarati" | "all";
   whisper_model: string;
   /** "auto" | "cuda" (first NVIDIA GPU) | "cuda:N" (that GPU) | "cpu". Applies to speech and the task AI. */
-  whisper_device: string;
+  device: string;
   vocabulary: string;
   unload_after_min: number;
   keep_audio_days: number;
   close_to_tray: boolean;
   detect_meetings: boolean;
+  auto_stop_meetings: boolean;
   task_jump_lead_s: number;
   hf_token: string;
-  ollama_url: string;
+  /** "auto" | "qwen3-1.7b" | "qwen3-4b" */
   llm_model: string;
 }
 
@@ -104,6 +105,8 @@ export interface SourceFocus {
   meetingId?: number;
   dictationId?: number;
   quote: string | null;
+  /** Exact time to play from (search results), instead of finding `quote`. */
+  atS?: number | null;
   leadS: number;
   play: boolean;
   /** Changes on every click, so clicking the same task again replays it. */
@@ -126,6 +129,25 @@ export interface Usage {
   gpu_total_gb: number | null;
 }
 
+export interface SearchHit {
+  kind: "recording" | "meeting" | "task";
+  title: string;
+  snippet: string;
+  match_start: number;
+  match_end: number;
+  created_at: string;
+  meeting_id: number | null;
+  dictation_id: number | null;
+  at_s: number | null;
+}
+
+export interface ModelInfo {
+  id: string;
+  name: string;
+  size_gb: number;
+  in_use: boolean;
+}
+
 export interface Levels {
   listening: number | null;
   mic: number | null;
@@ -146,6 +168,8 @@ export interface SessionStatus {
   meeting: { id: number; elapsed_s: number } | null;
   /** A call is on and the overlay offers to transcribe it ("Zoom"). */
   call_prompt: string | null;
+  /** Listening during that call: seconds until it becomes a meeting recording. */
+  call_switch_s: number | null;
 }
 
 export interface HeardPart {
@@ -156,7 +180,8 @@ export interface HeardPart {
 }
 
 export interface EngineStatus {
-  state: "loading" | "ready" | "sleeping" | "error";
+  /** "downloading": fetching a model first (`message` says which). */
+  state: "loading" | "downloading" | "ready" | "sleeping" | "error";
   device?: string;
   model?: string;
   message?: string;
@@ -172,16 +197,39 @@ export interface LlmStatus {
   installed: boolean;
   running: boolean;
   model_ready: boolean;
+  model: string;
   message: string;
+}
+
+/** "model-download" event: the engine is downloading a speech/voice/Gujarati/speaker model. */
+export interface ModelDownload {
+  what: string;
+  done_mb: number;
+  total_mb: number | null;
+}
+
+/** First-run speech-engine setup progress ("engine-setup" event, and SetupStatus while it runs). */
+export interface InstallProgress {
+  step: string;
+  pct: number;
+  detail: string;
 }
 
 export interface SetupStatus {
   engine_installed: boolean;
+  /** Optional packs of the first-run engine; null when not set up or in development. */
+  engine_packs: { nvidia: boolean; indic: boolean } | null;
   engine: EngineStatus;
   name_set: boolean;
   hf_token_set: boolean;
   voice_profile: boolean;
   llm: LlmStatus;
+  /** The speech-engine setup is running (started earlier, maybe from another visit to Settings). */
+  installing: boolean;
+  /** The task AI download is running. */
+  pulling: boolean;
+  /** Where the running engine setup is; null when not installing. */
+  install_progress: InstallProgress | null;
 }
 
 export interface DataPaths {
@@ -214,6 +262,15 @@ export const api = {
   watchedCallApps: () => invoke<string>("watched_call_apps"),
   hardwareInfo: () => invoke<Hardware>("hardware_info"),
   resourceUsage: () => invoke<Usage>("resource_usage"),
+  modelsInfo: () => invoke<ModelInfo[]>("models_info"),
+  search: (query: string) => invoke<SearchHit[]>("search_all", { query }),
+  engineInstall: (packs: { nvidia: boolean; indic: boolean }) => invoke<void>("engine_install", { packs }),
+  renameSpeaker: (meetingId: number, from: string, to: string, remember: boolean) =>
+    invoke<void>("rename_speaker", { meetingId, from, to, remember }),
+  updateTranscriptLine: (meetingId: number, index: number, text: string, words: Word[]) =>
+    invoke<void>("update_transcript_line", { meetingId, index, text, words }),
+  updateDictationText: (id: number, text: string, words: Word[]) => invoke<void>("update_dictation_text", { id, text, words }),
+  deleteModel: (id: string) => invoke<void>("delete_model", { id }),
   reprocessMeeting: (id: number, transcribe: boolean) => invoke<void>("reprocess_meeting", { id, transcribe }),
   listMeetings: () => invoke<Meeting[]>("list_meetings"),
   getTranscript: (id: number) => invoke<Segment[]>("get_transcript", { id }),
@@ -261,6 +318,13 @@ export function useEvent<T>(name: string, handler: (payload: T) => void) {
       unlisten?.();
     };
   }, [name]);
+}
+
+/** A playable Blob for recording bytes: FLAC (compressed recordings) or WAV. */
+export function audioBlob(bytes: ArrayBuffer): Blob {
+  const head = new Uint8Array(bytes, 0, Math.min(4, bytes.byteLength));
+  const flac = String.fromCharCode(...head) === "fLaC";
+  return new Blob([bytes], { type: flac ? "audio/flac" : "audio/wav" });
 }
 
 export function formatDuration(seconds: number): string {

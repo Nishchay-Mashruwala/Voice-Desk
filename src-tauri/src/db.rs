@@ -49,23 +49,28 @@ pub struct Settings {
     pub translate: String,
     /// "auto" picks by hardware and languages (see the engine's `_candidates`).
     pub whisper_model: String,
-    /// "auto" | "cuda" | "cpu"
-    pub whisper_device: String,
+    /// "auto" | "cuda" | "cuda:N" | "cpu": where speech, speaker detection and
+    /// the task AI run ("CPU only" also keeps the app's window off the GPU).
+    /// Saved settings from before the rename used `whisper_device`.
+    #[serde(alias = "whisper_device")]
+    pub device: String,
     /// Words Whisper should spell correctly (names, jargon).
     pub vocabulary: String,
     /// Free the speech engine's memory after this many idle minutes (0 = never).
     pub unload_after_min: u32,
-    /// Delete dictation recordings (not their text) after this many days (0 = keep forever).
+    /// Delete recordings, dictation and meetings (not their text), after this many days (0 = keep forever).
     pub keep_audio_days: u32,
     /// Closing the window keeps Voice Desk running in the tray (otherwise it quits).
     pub close_to_tray: bool,
     /// Offer to transcribe when a call app (Zoom, Meet in a browser...) starts using the mic.
     pub detect_meetings: bool,
+    /// End a meeting recording when its call ends, or after 3 quiet minutes.
+    pub auto_stop_meetings: bool,
     /// Opening a task's source starts playback this many seconds before the task was said.
     pub task_jump_lead_s: u32,
 
     pub hf_token: String,
-    pub ollama_url: String,
+    /// Task AI model: "auto" (by RAM), "qwen3-1.7b" or "qwen3-4b".
     pub llm_model: String,
 }
 
@@ -92,16 +97,16 @@ impl Default for Settings {
             prefer_indic: "gu".into(),
             translate: "gujarati".into(),
             whisper_model: "auto".into(),
-            whisper_device: "auto".into(),
+            device: "auto".into(),
             vocabulary: String::new(),
             unload_after_min: 10,
             keep_audio_days: 30,
             close_to_tray: false,
             detect_meetings: true,
+            auto_stop_meetings: true,
             task_jump_lead_s: 5,
             hf_token: String::new(),
-            ollama_url: "http://127.0.0.1:11434".into(),
-            llm_model: "qwen3:4b".into(),
+            llm_model: "auto".into(),
         }
     }
 }
@@ -286,6 +291,19 @@ const MIGRATIONS: &[&str] = &[
         ORDER BY d.created_at LIMIT 1
     ) WHERE kind = 'capture';
     "#,
+    // v6: remembered voices, so renamed speakers are recognised in later meetings.
+    r#"
+    CREATE TABLE IF NOT EXISTS people (
+        id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, embedding TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    "#,
+    // v7: the links between recordings, meetings and tasks are looked up on every
+    // list (task counts, underlined tasks); without indexes each one scans a table.
+    r#"
+    CREATE INDEX IF NOT EXISTS tasks_meeting ON tasks(meeting_id);
+    CREATE INDEX IF NOT EXISTS dictations_meeting ON dictations(meeting_id);
+    CREATE INDEX IF NOT EXISTS meetings_dictation ON meetings(dictation_id);
+    "#,
 ];
 
 impl Db {
@@ -317,11 +335,21 @@ impl Db {
     // ---- settings -------------------------------------------------------
 
     pub fn settings(&self) -> Result<Settings> {
-        Ok(self.get_value("app")?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default())
+        let mut s: Settings = self.get_value("app")?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        if s.hf_token.is_empty() {
+            s.hf_token = crate::secrets::hf_token();
+        }
+        Ok(s)
     }
 
+    /// The Hugging Face token goes to the credential store (see secrets.rs);
+    /// the database keeps it only if no store is available.
     pub fn save_settings(&self, s: &Settings) -> Result<()> {
-        self.set_value("app", &serde_json::to_string(s)?)
+        let mut saved = s.clone();
+        if crate::secrets::set_hf_token(&s.hf_token) {
+            saved.hf_token.clear();
+        }
+        self.set_value("app", &serde_json::to_string(&saved)?)
     }
 
     pub fn get_value(&self, key: &str) -> Result<Option<String>> {
@@ -371,14 +399,24 @@ impl Db {
         })
     }
 
+    /// The newest `limit` Listen recordings.
     pub fn dictations(&self, limit: i64) -> Result<Vec<Dictation>> {
+        self.query_dictations("1 = 1 ORDER BY d.id DESC LIMIT ?1", limit)
+    }
+
+    /// One Listen recording.
+    pub fn dictation(&self, id: i64) -> Result<Option<Dictation>> {
+        Ok(self.query_dictations("d.id = ?1", id)?.into_iter().next())
+    }
+
+    fn query_dictations(&self, filter: &str, param: i64) -> Result<Vec<Dictation>> {
         let c = self.0.lock().unwrap();
-        let mut st = c.prepare(
+        let mut st = c.prepare(&format!(
             "SELECT d.id, d.text, d.duration_ms, d.created_at, d.audio_path, d.words, m.id
              FROM dictations d LEFT JOIN meetings m ON m.id = d.meeting_id
-             ORDER BY d.id DESC LIMIT ?1",
-        )?;
-        let rows = st.query_map([limit], |r| {
+             WHERE {filter}"
+        ))?;
+        let rows = st.query_map([param], |r| {
             let audio: Option<String> = r.get(4)?;
             let words: Option<String> = r.get(5)?;
             Ok(Dictation {
@@ -393,15 +431,23 @@ impl Db {
             })
         })?;
         let mut out: Vec<Dictation> = rows.collect::<Result<_, _>>()?;
-        // Tasks from "Find tasks" on the recording, and from voice task recordings made during it.
+        let (Some(lo), Some(hi)) = (out.iter().map(|d| d.id).min(), out.iter().map(|d| d.id).max()) else {
+            return Ok(out);
+        };
+        // Tasks from "Find tasks" on the recording, and from voice task recordings
+        // made during it; only for the recordings listed (ids lo..=hi), by index.
         let mut st = c.prepare(
-            "SELECT d.id, t.description, t.quote FROM tasks t
-             JOIN meetings m ON m.id = t.meeting_id
-             JOIN dictations d ON d.meeting_id = m.id OR m.dictation_id = d.id
-             ORDER BY t.id",
+            "SELECT d.id, t.id, t.description, t.quote FROM dictations d
+             JOIN tasks t ON t.meeting_id = d.meeting_id
+             WHERE d.id BETWEEN ?1 AND ?2
+             UNION
+             SELECT m.dictation_id, t.id, t.description, t.quote FROM meetings m
+             JOIN tasks t ON t.meeting_id = m.id
+             WHERE m.dictation_id BETWEEN ?1 AND ?2
+             ORDER BY 2",
         )?;
-        let tasks = st.query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, DictationTask { description: r.get(1)?, quote: r.get(2)? }))
+        let tasks = st.query_map([lo, hi], |r| {
+            Ok((r.get::<_, i64>(0)?, DictationTask { description: r.get(2)?, quote: r.get(3)? }))
         })?;
         let mut by_dictation: std::collections::HashMap<i64, Vec<DictationTask>> = Default::default();
         for t in tasks {
@@ -509,6 +555,21 @@ impl Db {
         Ok(audio)
     }
 
+    /// The recording was compressed (WAV -> FLAC).
+    pub fn rename_dictation_audio(&self, from: &str, to: &str) -> Result<()> {
+        self.0.lock().unwrap().execute("UPDATE dictations SET audio_path = ?2 WHERE audio_path = ?1", params![from, to])?;
+        Ok(())
+    }
+
+    /// Meetings (and voice task recordings) started more than `days` ago: their audio expires.
+    pub fn meetings_older_than(&self, days: u32) -> Result<Vec<i64>> {
+        let cutoff = (chrono::Local::now() - chrono::Duration::days(days as i64)).to_rfc3339();
+        let c = self.0.lock().unwrap();
+        let mut st = c.prepare("SELECT id FROM meetings WHERE started_at < ?1")?;
+        let ids = st.query_map([&cutoff], |r| r.get(0))?.collect::<rusqlite::Result<Vec<i64>>>()?;
+        Ok(ids)
+    }
+
     /// Detach recordings older than `days`; returns their files to delete. Text is kept.
     pub fn expire_dictation_audio(&self, days: u32) -> Result<Vec<String>> {
         let c = self.0.lock().unwrap();
@@ -569,13 +630,21 @@ impl Db {
     }
 
     pub fn meetings(&self) -> Result<Vec<Meeting>> {
+        self.query_meetings("?1 IS NULL ORDER BY m.id DESC", None)
+    }
+
+    pub fn meeting(&self, id: i64) -> Result<Option<Meeting>> {
+        Ok(self.query_meetings("m.id = ?1", Some(id))?.into_iter().next())
+    }
+
+    fn query_meetings(&self, filter: &str, param: Option<i64>) -> Result<Vec<Meeting>> {
         let c = self.0.lock().unwrap();
-        let mut st = c.prepare(
+        let mut st = c.prepare(&format!(
             "SELECT m.id, m.title, m.kind, m.started_at, m.ended_at, m.status, m.error, m.duration_s, m.summary,
                     (SELECT COUNT(*) FROM tasks t WHERE t.meeting_id = m.id)
-             FROM meetings m ORDER BY m.id DESC",
-        )?;
-        let rows = st.query_map([], |r| {
+             FROM meetings m WHERE {filter}"
+        ))?;
+        let rows = st.query_map([param], |r| {
             Ok(Meeting {
                 id: r.get(0)?,
                 title: r.get(1)?,
@@ -592,8 +661,78 @@ impl Db {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    pub fn meeting(&self, id: i64) -> Result<Option<Meeting>> {
-        Ok(self.meetings()?.into_iter().find(|m| m.id == id))
+    /// Rename a speaker in one meeting: their lines and the tasks they gave.
+    pub fn rename_speaker(&self, meeting_id: i64, from: &str, to: &str) -> Result<()> {
+        let mut segments = self.transcript(meeting_id)?;
+        for s in segments.iter_mut().filter(|s| s.speaker == from) {
+            s.speaker = to.to_string();
+        }
+        let c = self.0.lock().unwrap();
+        c.execute(
+            "UPDATE meetings SET transcript = ?2 WHERE id = ?1",
+            params![meeting_id, serde_json::to_string(&segments)?],
+        )?;
+        c.execute(
+            "UPDATE tasks SET assigned_by = ?3 WHERE meeting_id = ?1 AND assigned_by = ?2",
+            params![meeting_id, from, to],
+        )?;
+        Ok(())
+    }
+
+    /// Change one transcript line's text (and its word timings).
+    pub fn update_transcript_line(&self, meeting_id: i64, index: usize, text: &str, words: Vec<Word>) -> Result<()> {
+        let mut segments = self.transcript(meeting_id)?;
+        let line = segments.get_mut(index).ok_or_else(|| anyhow::anyhow!("no such line"))?;
+        line.text = text.to_string();
+        line.words = Some(words);
+        self.0.lock().unwrap().execute(
+            "UPDATE meetings SET transcript = ?2 WHERE id = ?1",
+            params![meeting_id, serde_json::to_string(&segments)?],
+        )?;
+        Ok(())
+    }
+
+    /// Change a Listen recording's text (and its word timings).
+    pub fn update_dictation_text(&self, id: i64, text: &str, words: &serde_json::Value) -> Result<()> {
+        self.0.lock().unwrap().execute(
+            "UPDATE dictations SET text = ?2, words = ?3 WHERE id = ?1",
+            params![id, text, words.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Remembered voices: [{"name", "embedding"}] for the engine.
+    pub fn people(&self) -> Result<Vec<serde_json::Value>> {
+        let c = self.0.lock().unwrap();
+        let mut st = c.prepare("SELECT name, embedding FROM people ORDER BY name")?;
+        let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (name, emb) = row?;
+            let emb: serde_json::Value = serde_json::from_str(&emb).unwrap_or_default();
+            out.push(serde_json::json!({ "name": name, "embedding": emb }));
+        }
+        Ok(out)
+    }
+
+    /// Remember (or refresh) a person's voice. A voice heard again is averaged
+    /// with the one already stored, so it gets steadier over time.
+    pub fn remember_voice(&self, name: &str, embedding: &[f32]) -> Result<()> {
+        let c = self.0.lock().unwrap();
+        let old: Option<String> =
+            c.query_row("SELECT embedding FROM people WHERE name = ?1", [name], |r| r.get(0)).optional()?;
+        let mut v: Vec<f32> = embedding.to_vec();
+        if let Some(old) = old.and_then(|o| serde_json::from_str::<Vec<f32>>(&o).ok()).filter(|o| o.len() == v.len()) {
+            v.iter_mut().zip(old).for_each(|(a, b)| *a += b);
+        }
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+        v.iter_mut().for_each(|x| *x /= norm);
+        c.execute(
+            "INSERT INTO people (name, embedding, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(name) DO UPDATE SET embedding = excluded.embedding, updated_at = excluded.updated_at",
+            params![name, serde_json::to_string(&v)?, now()],
+        )?;
+        Ok(())
     }
 
     pub fn transcript(&self, id: i64) -> Result<Vec<Segment>> {
@@ -745,6 +884,38 @@ mod tests {
     }
 
     #[test]
+    fn renaming_a_speaker_updates_lines_and_tasks() {
+        let db = db();
+        let m = db.create_meeting("call", "meeting").unwrap();
+        let seg = |spk: &str, t: &str| Segment { start: 0.0, end: 1.0, speaker: spk.into(), text: t.into(), words: None };
+        db.save_transcript(m, &[seg("Speaker 1", "send the deck"), seg("Me", "sure")], 2.0).unwrap();
+        db.add_task(Some(m), &NewTask { description: "Send the deck".into(), assigned_by: Some("Speaker 1".into()), due: None, quote: None }).unwrap();
+        db.rename_speaker(m, "Speaker 1", "Priya").unwrap();
+        let t = db.transcript(m).unwrap();
+        assert_eq!((t[0].speaker.as_str(), t[1].speaker.as_str()), ("Priya", "Me"));
+        assert_eq!(db.tasks(Some(m)).unwrap()[0].assigned_by.as_deref(), Some("Priya"));
+    }
+
+    #[test]
+    fn remembered_voices_average_and_stay_unit_length() {
+        let db = db();
+        db.remember_voice("Priya", &[1.0, 0.0]).unwrap();
+        db.remember_voice("Priya", &[0.0, 1.0]).unwrap();
+        let p = db.people().unwrap();
+        assert_eq!(p.len(), 1);
+        let e: Vec<f32> = serde_json::from_value(p[0]["embedding"].clone()).unwrap();
+        let half = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((e[0] - half).abs() < 1e-3 && (e[1] - half).abs() < 1e-3);
+    }
+
+    #[test]
+    fn old_device_setting_still_loads() {
+        let s: Settings = serde_json::from_str(r#"{"whisper_device":"cpu"}"#).unwrap();
+        assert_eq!(s.device, "cpu");
+        assert!(serde_json::to_string(&s).unwrap().contains(r#""device":"cpu""#));
+    }
+
+    #[test]
     fn converts_between_recording_and_meeting() {
         let db = db();
         let words = serde_json::json!([{ "w": "hello", "s": 0.0, "e": 0.5 }]);
@@ -776,6 +947,34 @@ mod tests {
         let listed = db.dictations(10).unwrap();
         assert_eq!((listed[0].id, listed[0].tasks.len()), (back, 1));
         assert_eq!(db.tasks(Some(m)).unwrap()[0].dictation_id, Some(back));
+        assert_eq!(db.dictation(back).unwrap().unwrap().tasks.len(), 1);
+        assert!(db.dictation(back + 100).unwrap().is_none());
+    }
+
+    #[test]
+    fn lists_only_their_own_tasks() {
+        let db = db();
+        let old = db.add_dictation("old", 1000, None, &serde_json::Value::Null).unwrap();
+        let holder = db.create_meeting("holder", "dictation").unwrap();
+        db.set_dictation_meeting(old.id, holder).unwrap();
+        db.add_task(Some(holder), &task("old task")).unwrap();
+        let new = db.add_dictation("new", 1000, None, &serde_json::Value::Null).unwrap();
+        let cap = db.create_meeting("capture", "capture").unwrap();
+        db.link_captures(new.id, &[cap]).unwrap();
+        db.add_task(Some(cap), &task("new task")).unwrap();
+        let latest = db.dictations(1).unwrap();
+        assert_eq!((latest.len(), latest[0].id), (1, new.id));
+        assert_eq!(latest[0].tasks.iter().map(|t| t.description.as_str()).collect::<Vec<_>>(), ["new task"]);
+        let both = db.dictations(10).unwrap();
+        assert_eq!(both[1].tasks.iter().map(|t| t.description.as_str()).collect::<Vec<_>>(), ["old task"]);
+        assert_eq!(db.meeting(cap).unwrap().unwrap().task_count, 1);
+        assert_eq!(db.meetings().unwrap().len(), 2);
+        // The lookups use the indexes.
+        let c = db.0.lock().unwrap();
+        let plan: String = c
+            .query_row("EXPLAIN QUERY PLAN SELECT COUNT(*) FROM tasks WHERE meeting_id = 1", [], |r| r.get(3))
+            .unwrap();
+        assert!(plan.contains("tasks_meeting"), "{plan}");
     }
 
     #[test]
