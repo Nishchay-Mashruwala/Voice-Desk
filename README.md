@@ -11,7 +11,7 @@ Everything runs on your computer. No audio or text leaves it.
 
 | | Minimum | Recommended |
 |---|---|---|
-| System | Windows 10/11 (64-bit), macOS 14.2+ (14.6+ to record the other side of calls), or Linux with PipeWire | Windows 10/11 — meeting auto-detection is Windows-only for now |
+| System | Windows 10/11 (64-bit), macOS 14.2+ (14.6+ to record the other side of calls), or Linux with PipeWire | Windows 10/11 |
 | Processor | 4-core 64-bit CPU (x86-64 or Apple Silicon) | 6–8 cores |
 | Memory | 8 GB RAM | 16 GB RAM |
 | Graphics | None needed — everything runs on the CPU | NVIDIA GPU with 4 GB+ (and a current driver). AMD/Intel graphics are used by the task AI only (Vulkan) |
@@ -28,18 +28,18 @@ What Voice Desk itself uses at its busiest (processing a meeting): about **3 GB 
 | Telling speakers apart | ~11 s · ~0.1 GB RAM (always on the CPU) | ~11 s · ~0.1 GB RAM |
 | Finding tasks (Qwen3 4B) | 26 s · 1.3 GB RAM · 2.3 GB GPU | 47 s · 2.8 GB RAM · 3.6 cores |
 
-Heavy work never uses more than half the CPU cores, so the computer stays usable. Disk: the speech engine and the speech model for your computer ~0.9 GB (+~2.8 GB for the optional NVIDIA speed-up), the task AI 1.1 GB (Qwen3 1.7B) or 2.5 GB (Qwen3 4B), and Hindi/Gujarati support only if you pick those languages. Recordings are kept as FLAC (lossless, about half the size of WAV). **Settings → Storage** lists every downloaded model and deletes the ones you don't use.
+Heavy work never uses more than half the CPU cores, so the computer stays usable. Disk: the speech engine and the speech model for your computer ~0.9 GB (+~2.8 GB for the optional NVIDIA speed-up), the task AI 1.1 GB (Qwen3 1.7B) or 2.5 GB (Qwen3 4B), and Hindi/Gujarati (1.0 GB) only if you pick those languages. Recordings are kept as FLAC (lossless, about half the size of WAV). **Settings → Storage** lists every downloaded model and deletes the ones you don't use.
 
 ## Install (for you and your friends)
 
-**Friends:** download the installer for your computer from [GitHub Releases](https://github.com/Nishchay-Mashruwala/Voice-Desk/releases/latest) (~20 MB). Windows may show "Windows protected your PC" because the app isn't code-signed: click **More info → Run anyway**. On a Mac the app isn't signed either: the first time, **right-click Voice Desk → Open** (then **Open** again) so Gatekeeper lets it start. On first start, **Settings → Getting ready** shows what this computer needs and how big it is, downloads it (resumable), and from then on everything works offline. Updates install from inside the app.
+**Friends:** download the installer for your computer from [GitHub Releases](https://github.com/Nishchay-Mashruwala/Voice-Desk/releases/latest) (~20 MB). Windows may show "Windows protected your PC" because the app isn't code-signed: click **More info → Run anyway**. On a Mac the app isn't signed either: the first time, **right-click Voice Desk → Open** (then **Open** again) so Gatekeeper lets it start. On first start, **Settings → Getting ready** shows what this computer needs and how big it is, downloads it (resumable), and from then on everything works offline. Anything already on the computer (from an earlier install, or a setup that was interrupted) is kept and never offered again: Voice Desk finishes such a setup by itself at start, fetching only what's missing or changed, and only the speech models your settings use. Updates install from inside the app.
 
 **Building from source:** on Windows double-click **`Setup Voice Desk (Windows).bat`**; on macOS / Linux run `bash scripts/setup.sh`. The script installs whatever is missing (Node.js, Rust, build tools, Python via `uv`), builds Voice Desk, and adds a **Voice Desk** shortcut; running it again skips finished steps.
 
 Then open Voice Desk and go to **Settings**:
 1. **About you:** enter your name.
 2. **Your voice:** read a short passage (about 15 s) so only you can give commands.
-3. *(Only for Hindi/Gujarati)* accept the terms on [the model page](https://huggingface.co/ai4bharat/indic-conformer-600m-multilingual), create a Hugging Face token with **Read** access, and paste it under **Speech recognition** (it's kept in the system keychain). Add Hindi/Gujarati under **Getting ready** (from source: run the setup with `-Indic` on Windows or `VOICEDESK_INDIC=1` on macOS/Linux). Not available on Intel Macs (no current PyTorch for them).
+3. *(Only for Hindi/Gujarati)* accept the terms on [the model page](https://huggingface.co/ai4bharat/indic-conformer-600m-multilingual), create a Hugging Face token with **Read** access, and paste it under **Speech recognition** (it's kept in the system keychain). Add Hindi/Gujarati under **Getting ready** (from source: run the setup with `-Indic` on Windows or `VOICEDESK_INDIC=1` on macOS/Linux). The model (2.4 GB) downloads the first time you speak Hindi/Gujarati and is kept as a 1.0 GB copy.
 
 Speaker detection (telling meeting participants apart) works out of the box.
 
@@ -47,12 +47,12 @@ Speaker detection (telling meeting participants apart) works out of the box.
 
 | | |
 |---|---|
-| Start/stop listening | Your shortcut (default `Ctrl+Shift+Space`), the tray icon, or the mic button. In Settings, choose single press, double press, long press (hold N seconds), or push-to-talk. |
+| Start/stop listening | Your shortcut (default `Ctrl+Shift+Space`), the tray icon, or the mic button. In Settings, choose single press, double press, long press (hold N seconds), or push-to-talk, and whether the shortcut starts listening or a **meeting recording** (listening already on then becomes the start of the meeting). |
 | Floating bar | Appears while listening: Pause/Resume, Record tasks, Stop. While a meeting is recorded it turns red with a timer and Stop. Drag it anywhere; it remembers where you put it. It never takes the cursor from your app. |
 | Voice commands | Say the assistant name first (default **Jarvis**). The phrases can be changed in Settings. |
 | History | Every listening session is recorded. Press play and the words light up as they're spoken; click a word to jump there. Words that became tasks are underlined. **👥** turns a recording into a meeting (speakers detected, tasks found). |
 | Copy last dictation | Right-click the tray icon, or right-click Voice Desk's taskbar button (Windows). |
-| Meetings | When Zoom, Teams, WhatsApp, Discord, Slack, Skype, Webex or a browser call (Google Meet…) starts, the floating bar offers **Transcribe Meeting**; ✕ hides it for that call (Windows). While it's offered, your shortcut (or the mic button) starts the meeting recording too, and stops it later. Videos and music never count as calls. Playback highlights each word; **Move to Listen history** turns a meeting back into a normal recording, keeping its tasks. |
+| Meetings | When Zoom, Teams, WhatsApp, Discord, Slack, Skype, Webex, FaceTime (Mac) or a browser call (Google Meet…) starts, the floating bar offers **Transcribe Meeting**; ✕ hides it for that call. A browser counts when its window shows a call site; where window titles can't be read (a Mac without the Screen Recording permission, Wayland on Linux), it counts once it has used the mic and played sound together for 20 seconds, so dictating in Google Docs or a quick voice search isn't a call. On Linux it needs `pactl` (PipeWire or PulseAudio); with `wmctrl` or `xprop` installed, X11 windows are checked by title. While it's offered, your shortcut (or the mic button) starts the meeting recording too, and stops it later. Videos and music never count as calls. Playback highlights each word; **Move to Listen history** turns a meeting back into a normal recording, keeping its tasks. |
 | Tasks | Click a task's source to hear where it was said (5 s before, or right at it — Settings → Task AI). Copy a task with its copy button. |
 | Deleting | Recordings, meetings and tasks ask first, then can be undone for 5 seconds. |
 
@@ -89,7 +89,7 @@ Default commands (never typed):
 │                voice commands, task recording                      │
 │   audio.rs     mic + system-audio capture, 16 kHz resampling       │
 │   pipeline.rs  meeting/task-recording → transcript → tasks         │
-│   meeting_detect.rs  which call app has the mic (Windows)          │
+│   meeting_detect.rs  which call app has the mic (all three OS)     │
 │   hardware.rs  GPUs, RAM, cores; memory in use                     │
 │   llm.rs       Qwen3 via llama-server (started only when needed)   │
 │   db.rs        SQLite                                              │
@@ -105,13 +105,13 @@ Default commands (never typed):
              speakers.py     who spoke when (sherpa-onnx, 46 MB of ONNX models)
 ```
 
-**Tech stack.** Desktop shell: [Tauri 2](https://tauri.app) (Rust) with a React 19 + TypeScript 6 UI built by Vite 8. Backend crates: cpal (audio capture), rusqlite (SQLite), reqwest + tokio (downloads, task AI), enigo/arboard (typing at the cursor), sysinfo, winreg (call detection), keyring (token storage), tauri-plugin-updater. Speech engine: Python 3.12 with faster-whisper (CTranslate2), Silero VAD, onnxruntime (voice ID, speakers, IndicConformer). Task AI: Qwen3 1.7B or 4B (GGUF) in llama.cpp's `llama-server` (CPU or Vulkan). No cloud: the UI talks to Rust over Tauri's IPC, Rust to the engine over JSON lines on stdin/stdout, and to `llama-server` on localhost.
+**Tech stack.** Desktop shell: [Tauri 2](https://tauri.app) (Rust) with a React 19 + TypeScript 6 UI built by Vite 8. Backend crates: cpal (audio capture), rusqlite (SQLite), reqwest + tokio (downloads, task AI), enigo/arboard (typing at the cursor), sysinfo, winreg / CoreAudio / pactl (call detection), keyring (token storage), tauri-plugin-updater. Speech engine: Python 3.12 with faster-whisper (CTranslate2), Silero VAD, onnxruntime (voice ID, speakers, IndicConformer). Task AI: Qwen3 1.7B or 4B (GGUF) in llama.cpp's `llama-server` (CPU or Vulkan). No cloud: the UI talks to Rust over Tauri's IPC, Rust to the engine over JSON lines on stdin/stdout, and to `llama-server` on localhost.
 
 **Accuracy.** With room on an NVIDIA GPU, the engine uses Whisper large-v3-turbo for English (medium when Hindi/Gujarati are on, large-v3 when translating); in testing, `small` misheard "Nishchay" as "next time" and turbo didn't. Your name, the assistant name and your vocabulary are passed to Whisper as hints. The task AI is **Qwen3 4B** on computers with 6 GB+ of RAM, because accuracy matters more than size: in tests Qwen3 1.7B missed tasks that 4B found. 1.7B is still selectable in **Settings → Task AI** (and is used below 6 GB).
 
 **English inside Hindi/Gujarati.** With English and Gujarati (or Hindi) both chosen, Gujarati is written in Gujarati script and English said in between, words or whole sentences, in English: "હા એનું background તો Scottish છે". IndicConformer writes each chunk, Whisper reads the same audio as English once, and `engine/mixed.py` combines them word by word by time and sound, using a bundled English word list (SCOWL) to tell English from Gujarati written in Latin letters.
 
-**Memory.** Speaker detection uses small ONNX models (~0.1 GB of RAM; 11 s for a 70 s call on a CPU). PyTorch is only installed and loaded for Hindi/Gujarati. After 10 idle minutes (configurable), the speech engine shuts down and frees all its memory; it restarts when you next talk, and nothing you say while it starts is lost.
+**Memory.** Speaker detection uses small ONNX models (~0.1 GB of RAM; 11 s for a 70 s call on a CPU). Nothing uses PyTorch: Hindi/Gujarati (IndicConformer) runs on onnxruntime too, ~1.1 GB of RAM while loaded, ready in ~4 s. After 10 idle minutes (configurable), the speech engine shuts down and frees all its memory; it restarts when you next talk, and nothing you say while it starts is lost.
 
 **Any computer.** Settings → Processor (Auto, a specific NVIDIA GPU, or CPU only) applies to speech, speaker detection and the task AI. Auto picks a Whisper model that fits the GPU's free memory (or the CPU), heavy work uses half the CPU cores, and the task AI only reserves the memory its transcript needs. To see what each job uses on a computer: `.venv/Scripts/python engine/bench_resources.py meeting-N-mic.wav meeting-N-system.wav [--device cpu]`.
 
@@ -152,5 +152,5 @@ Installers are built by GitHub Actions ([.github/workflows/build.yml](.github/wo
 - [x] One-command setup for Windows, macOS and Linux
 - [x] Small installers on GitHub Releases; first start downloads what the computer needs; auto-update
 - [x] Rename speakers and remember their voices, edit transcript lines, full-text search
-- [x] Auto-detect meetings (Windows), playback for meeting recordings with word highlighting
-- [ ] Meeting detection on macOS/Linux, calendar export
+- [x] Auto-detect meetings (Windows, macOS, Linux), playback for meeting recordings with word highlighting
+- [ ] Calendar export

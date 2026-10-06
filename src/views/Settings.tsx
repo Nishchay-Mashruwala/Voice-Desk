@@ -141,7 +141,8 @@ export default function SettingsView({
   const task = taskSpec(s.llm_model, setup?.llm.model ?? "", hw, s.device);
   const taskReady = !!setup && setup.llm.installed && setup.llm.model_ready;
   const taskChanged = s.llm_model !== settings.llm_model;
-  const needTaskAi = !!setup && (taskChanged ? !(setup.llm.installed && downloaded.some((d) => d.endsWith(task.file))) : !taskReady);
+  const taskModelReady = !!setup && (taskChanged ? downloaded.some((d) => d.endsWith(task.file)) : setup.llm.model_ready);
+  const needTaskAi = !!setup && !(setup.llm.installed && taskModelReady);
   const showGettingReady = !!setup && (!setup.engine_installed || needIndic || needTaskAi || setup.installing || setup.pulling);
 
   const speechDetail = !setup
@@ -151,7 +152,9 @@ export default function SettingsView({
       : setup.installing
         ? "Being set up — see Getting ready above."
         : !setup.engine_installed
-          ? "Not downloaded yet — see Getting ready above."
+          ? setup.engine_partial
+            ? "Already on this computer — its setup needs finishing (see Getting ready above)."
+            : "Not downloaded yet — see Getting ready above."
           : engine?.state === "ready"
             ? `Ready: ${engine.model} on ${engine.device === "cuda" ? "GPU" : "CPU"}`
             : engine?.state === "sleeping"
@@ -199,6 +202,7 @@ export default function SettingsView({
                 needEngine={!setup.engine_installed}
                 needIndic={needIndic}
                 needTaskAi={needTaskAi}
+                taskModelReady={taskModelReady}
                 task={task}
                 ensureSaved={save}
                 onDone={() => {
@@ -253,7 +257,37 @@ export default function SettingsView({
           <Field label="Shortcut" hint="Click, then press 1–3 keys together (Esc to cancel).">
             <HotkeyInput value={s.dictation_hotkey} onChange={(v) => set("dictation_hotkey", v)} />
           </Field>
-          <Field label="How the shortcut works">
+          <div className="field">
+            <span className="field-label">The shortcut starts</span>
+            <div className="segmented" role="radiogroup" aria-label="The shortcut starts">
+              {(
+                [
+                  ["listen", "Listening (typing)"],
+                  ["meeting", "Meeting recording"],
+                ] as const
+              ).map(([value, label]) => (
+                <button
+                  key={value}
+                  type="button"
+                  role="radio"
+                  aria-checked={s.shortcut_starts === value}
+                  className={s.shortcut_starts === value ? "on" : ""}
+                  onClick={() => set("shortcut_starts", value)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            <span className="field-hint">
+              {s.shortcut_starts === "meeting"
+                ? "Records you and the computer's audio, then finds tasks. If you're already listening, that becomes the start of the meeting. Press twice to stop. The tray and the mic button still start listening."
+                : "Types what you say wherever your cursor is. During a call, the shortcut records the meeting instead."}
+            </span>
+          </div>
+          <Field
+            label="How the shortcut works"
+            hint={s.shortcut_starts === "meeting" && s.dictation_mode === "hold" ? "For a meeting, push-to-talk works as press to start, press to stop." : undefined}
+          >
             <select value={s.dictation_mode} onChange={(e) => set("dictation_mode", e.target.value as Settings["dictation_mode"])}>
               <option value="toggle">Single press — press to start, press to stop</option>
               <option value="double">Double press — press twice quickly to start / stop</option>
@@ -327,7 +361,7 @@ export default function SettingsView({
             on={s.detect_meetings}
             onChange={(v) => set("detect_meetings", v)}
             label="Detect meetings"
-            hint={`When a call starts, the floating bar offers to transcribe it; your shortcut starts it too (✕ means not this call). Browsers count only on a call site (Meet, Zoom, Teams, WhatsApp…). Watches ${callApps || "call apps"}. Windows only for now.`}
+            hint={`When a call starts, the floating bar offers to transcribe it; your shortcut starts it too (✕ means not this call). Browsers count only on a call site (Meet, Zoom, Teams, WhatsApp…). Watches ${callApps || "call apps"}.`}
           />
           <Toggle
             on={s.auto_stop_meetings}

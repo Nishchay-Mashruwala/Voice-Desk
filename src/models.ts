@@ -148,10 +148,13 @@ export const gb = (n: number) => (n < 1 ? `${Math.round(n * 1000)} MB` : `${n.to
 /**
  * What first-run setup downloads (GB), as the engine installer fetches it:
  * the speech engine itself, then either the NVIDIA (CUDA) or the CPU runtime
- * with a starter speech model, and the Hindi/Gujarati pack (IndicConformer,
- * kept as the int8 model).
+ * with a starter speech model, and the Hindi/Gujarati pack (what shrinks its
+ * model to int8; no PyTorch).
  */
-export const ENGINE_DOWNLOAD = { base: 0.4, nvidia: 3.3, cpu: 0.5, indic: 1.7 };
+export const ENGINE_DOWNLOAD = { base: 0.4, nvidia: 3.3, cpu: 0.5, indic: 0.03 };
+/** The Hindi/Gujarati model (IndicConformer), downloaded when first used and then
+ * kept as a 1.0 GB int8 copy. */
+export const INDIC_MODEL_GB = 2.4;
 /** The task AI's runtime (llama-server), downloaded with its first model. */
 export const TASK_RUNTIME_GB = 0.03;
 

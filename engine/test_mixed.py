@@ -259,6 +259,46 @@ def test_hindi_or_gujarati_when_only_one_is_translated():
         assert pick(_Whisper(hi=0.9, en=0.05), audio, langs, "gu", True) == "gu"
 
 
+def test_indic_features_match_the_models_preprocessor():
+    """indic.features (NumPy) against the repo's preprocessor.ts (TorchScript):
+    values it gave for a fixed chirp (4 decimals), and, when torch and the
+    downloaded model are both here (development), the whole output."""
+    import numpy as np
+
+    from indic import features
+
+    t = np.arange(8000) / 16000
+    x = (0.3 * np.sin(2 * np.pi * (200 + 3000 * t) * t) + 0.1 * np.sin(2 * np.pi * 2500 * t) * np.exp(-4 * t)).astype(np.float32)
+    f, n = features(x)
+    assert f.shape == (1, 80, 51) and f.dtype == np.float32 and n.tolist() == [51] and n.dtype == np.int64
+    reference = {  # band: frames 0, 7, 25, 50
+        0: [3.9637, -0.2351, -0.3304, 4.4755],
+        10: [1.4897, 0.9072, -0.5199, 2.0718],
+        30: [-0.4425, -0.542, -0.3136, 1.7991],
+        50: [0.8494, 0.7301, -0.2842, -1.3248],
+        79: [4.0074, -0.2733, -0.2733, 4.62],
+    }
+    for band, values in reference.items():
+        assert np.allclose(f[0, band, [0, 7, 25, 50]], values, atol=2e-4), (band, f[0, band, [0, 7, 25, 50]])
+    try:
+        import torch
+
+        from indic import local_snapshot
+
+        snapshot = local_snapshot()
+    except Exception:  # noqa: BLE001  (no torch, or no model: the reference above is the test)
+        return
+    if snapshot is None:
+        return
+    pre = torch.jit.load(os.path.join(snapshot, "assets", "preprocessor.ts"))
+    rng = np.random.default_rng(0)
+    for x in (x, (0.05 * rng.standard_normal(16000 * 3)).astype(np.float32)):
+        with torch.inference_mode():
+            ref, length = pre(input_signal=torch.from_numpy(x).unsqueeze(0), length=torch.tensor([len(x)]))
+        f, n = features(x)
+        assert n.tolist() == length.tolist() and np.abs(f - ref.numpy()).max() < 1e-3
+
+
 if __name__ == "__main__":
     tests = [v for k, v in dict(globals()).items() if k.startswith("test_")]
     for t in tests:

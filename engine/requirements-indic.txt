@@ -1,9 +1,7 @@
 # Hindi/Gujarati written in their own script (AI4Bharat IndicConformer).
 # Only needed when one of them is chosen in Settings -> Speech recognition.
-# The CPU build of PyTorch is enough (and much smaller):
-#   uv pip install --python .venv/Scripts/python -r engine/requirements-indic.txt -c engine/constraints.txt --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
-# Versions are pinned in constraints.txt. Not available on Intel Macs (no
-# current PyTorch build there).
-torch
-transformers>=4.40  # loads the model's own code
+#   uv pip install --python .venv/Scripts/python -r engine/requirements-indic.txt -c engine/constraints.txt
+# The model itself runs on onnxruntime (already in requirements.txt); this pack
+# only adds what shrinks it to int8 once after the download (~25 MB).
+# Versions are pinned in constraints.txt.
 onnx>=1.16  # shrinking the model to int8 (once)

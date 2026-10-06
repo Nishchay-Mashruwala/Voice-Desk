@@ -6,8 +6,10 @@ Indian speech, got the same recordings nearly right in 2-3 s on the CPU. Whisper
 still decides English vs Indian language and writes English.
 
 The model is gated on Hugging Face (accept its terms once, then the token in
-Settings downloads it). It runs on onnxruntime + a small TorchScript feature
-extractor, so torch is loaded in this process only once it is first used.
+Settings downloads it). It runs on onnxruntime alone: the repo's own inference
+code needs PyTorch and transformers (~0.7 GB to install, no Intel-Mac builds,
+and importing transformers took ~14 s of the ~30 s load), so its steps are
+redone here (`Conformer`, `features`). Now ready in ~4 s, ~0.4 GB less RAM.
 
 Memory: the encoder's 2.4 GB of float32 weights are quantized once to int8
 (matrix multiplications only) and cached: 1.0 GB loaded instead of 2.4 GB, 35%
@@ -21,13 +23,12 @@ it return empty text.
 from __future__ import annotations
 
 import gc
-import importlib.util
+import json
 import os
 import subprocess
 import sys
 import threading
 import time
-import types
 
 import numpy as np
 
@@ -216,27 +217,12 @@ class IndicASR:
                 if path is None:
                     log("downloading IndicConformer (2.4 GB)...")
                     path = hub_snapshot(REPO, DOWNLOAD_NAME, token)
-                # The repo's own inference code (transformers "remote code"), loaded
-                # from the local snapshot so no network is needed after the download.
-                spec = importlib.util.spec_from_file_location("indic_conformer_onnx", os.path.join(path, "model_onnx.py"))
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-                # PyTorch (the model's feature extractor) has a second thread pool
-                # that ignores OMP_NUM_THREADS: it briefly used ~11 of 16 threads.
-                import torch
-
-                torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS") or 2))
-                try:
-                    torch.set_num_interop_threads(1)
-                except RuntimeError:  # only allowed before the first parallel work
-                    pass
                 encoder = int8_encoder(path)
                 if encoder is None and not float_encoder_complete(path):
                     log("downloading the model's full-size encoder again to rebuild the small copy...")
                     path = hub_snapshot(REPO, DOWNLOAD_NAME, token)
                     encoder = int8_encoder(path)
-                mod.ort = types.SimpleNamespace(InferenceSession=_session_factory(encoder))
-                self.model = mod.IndicASRModel(mod.IndicASRConfig(ts_folder=path, FRAME_DURATION_MS=0.08))
+                self.model = Conformer(path, encoder)
                 self.failed = None
                 log(f"ready in {time.time() - t:.1f}s")
                 return True
@@ -257,15 +243,13 @@ class IndicASR:
     def pick(self, audio: np.ndarray, prefer: str, choices: list[str]) -> str:
         """Which of `choices` (e.g. ["hi", "gu"]) this speech is in, from its
         first chunk (see `_pick`); `prefer` unless another clearly fits better."""
-        import torch
-
         model = self.model
         piece = audio[: MAX_CHUNK_S * 16000]
         if model is None or len(piece) < 1600:
             return prefer
         self.last_used = time.time()
-        with self._run_lock, torch.inference_mode():
-            enc, _ = model.encode(torch.from_numpy(np.ascontiguousarray(_louder(piece))).unsqueeze(0))
+        with self._run_lock:
+            enc, _ = model.encode(_louder(piece))
             return self._pick(model, enc, prefer, choices)
 
     def transcribe_words(self, audio: np.ndarray, lang: str, choices: list[str] | None = None) -> tuple[list[dict], str]:
@@ -275,20 +259,18 @@ class IndicASR:
         `choices` (e.g. ["hi", "gu"]): the language is picked among these from
         the first chunk's sound, staying with `lang` unless another clearly fits
         better. Whisper can't tell Hindi from Gujarati; this can (see `_pick`)."""
-        import torch
-
         model = self.model
         if model is None:
             raise RuntimeError("IndicConformer not loaded")
         self.last_used = time.time()
         step = MAX_CHUNK_S * 16000
         words: list[dict] = []
-        with self._run_lock, torch.inference_mode():
+        with self._run_lock:
             for i in range(0, len(audio), step):
                 piece = audio[i : i + step]
                 if len(piece) < 1600:  # < 0.1 s
                     continue
-                enc, lens = model.encode(torch.from_numpy(np.ascontiguousarray(_louder(piece))).unsqueeze(0))
+                enc, lens = model.encode(_louder(piece))
                 if i == 0 and choices and len(choices) > 1:
                     lang = self._pick(model, enc, lang, choices)
                 # RNNT decoding: more accurate than CTC on the user's recordings.
@@ -316,12 +298,12 @@ class IndicASR:
         # Greedy CTC: a token repeated over frames counts once; blanks separate.
         pieces, prev = [], None
         for t, token in enumerate(path.tolist()):
-            if token != prev and token != model.config.BLANK_ID:
+            if token != prev and token != model.BLANK_ID:
                 pieces.append((model.vocab[lang][token], t))
             prev = token
         fill = [
             dict(w, ctc=True)
-            for w in _words(pieces, offset, float(model.config.FRAME_DURATION_MS))
+            for w in _words(pieces, offset, model.FRAME_S)
             if any(a <= (w["s"] + w["e"]) / 2 < b for a, b in gaps)
         ]
         if fill:
@@ -330,40 +312,39 @@ class IndicASR:
 
     @staticmethod
     def _decode_words(model, enc, lang: str, offset: float) -> list[dict]:
-        """The model's own greedy RNNT decoding (`_rnnt_decode`, same steps and
-        text), also noting the encoder frame each piece came out at: words get
-        real times instead of being spread evenly over the phrase."""
-        import torch
-
-        cfg = model.config
-        joint_enc = torch.from_numpy(model.models["joint_enc"].run(["output"], {"input": enc.transpose(0, 2, 1)})[0])
-        hyp = [cfg.SOS]
+        """The model's own greedy RNNT decoding (`_rnnt_decode` in the repo's
+        model_onnx.py, same steps and text), also noting the encoder frame each
+        piece came out at: words get real times instead of being spread evenly
+        over the phrase."""
+        joint_enc = model.models["joint_enc"].run(["output"], {"input": enc.transpose(0, 2, 1)})[0]
+        post_net = model.post_net(lang)
+        hyp = [model.SOS]
         frames: list[int] = []
         state = (
-            np.zeros((cfg.PRED_RNN_LAYERS, 1, cfg.PRED_RNN_HIDDEN_DIM), dtype=np.float32),
-            np.zeros((cfg.PRED_RNN_LAYERS, 1, cfg.PRED_RNN_HIDDEN_DIM), dtype=np.float32),
+            np.zeros((model.PRED_RNN_LAYERS, 1, model.PRED_RNN_HIDDEN_DIM), dtype=np.float32),
+            np.zeros((model.PRED_RNN_LAYERS, 1, model.PRED_RNN_HIDDEN_DIM), dtype=np.float32),
         )
-        for t in range(joint_enc.size(1)):
-            f = joint_enc[:, t, :].unsqueeze(1)
+        for t in range(joint_enc.shape[1]):
+            f = joint_enc[:, t : t + 1, :]
             added = 0
-            while cfg.RNNT_MAX_SYMBOLS is None or added < cfg.RNNT_MAX_SYMBOLS:
+            while added < model.RNNT_MAX_SYMBOLS:
                 g, _, s0, s1 = model.models["rnnt_decoder"].run(
                     ["outputs", "prednet_lengths", "states", "162"],
                     {"targets": np.array([[hyp[-1]]], dtype=np.int32), "target_length": np.array([1], dtype=np.int32),
                      "states.1": state[0], "onnx::Slice_3": state[1]},
                 )
                 g = model.models["joint_pred"].run(["output"], {"input": g.transpose(0, 2, 1)})[0]
-                joint = model.models["joint_pre_net"].run(["output"], {"input": (f + g).numpy()})[0]
-                logits = model.models[f"joint_post_net_{lang}"].run(["output"], {"input": joint})[0]
+                joint = model.models["joint_pre_net"].run(["output"], {"input": f + g})[0]
+                logits = post_net.run(["output"], {"input": joint})[0]
                 token = int(np.argmax(logits, axis=-1).item())
                 added += 1
-                if token == cfg.BLANK_ID:
+                if token == model.BLANK_ID:
                     break
                 hyp.append(token)
                 frames.append(t)
                 state = (s0, s1)
         pieces = [(model.vocab[lang][token], t) for token, t in zip(hyp[1:], frames)]
-        return _words(pieces, offset, float(cfg.FRAME_DURATION_MS))
+        return _words(pieces, offset, model.FRAME_S)
 
     # How much better (mean log-prob per letter) another language must fit to
     # override the preferred one. Measured on the user's recordings: Hindi fits
@@ -374,14 +355,12 @@ class IndicASR:
     def _pick(self, model, enc, prefer: str, choices: list[str]) -> str:
         """Which language's letters explain the audio best, from the CTC head:
         each language's vocabulary is scored on its own, on non-silent frames."""
-        import torch
-
         logprobs = model.models["ctc_decoder"].run(["logprobs"], {"encoder_output": enc})[0][0]
         scores = {}
         for code in choices:
-            lp = torch.from_numpy(logprobs[:, model.language_masks[code]]).log_softmax(-1)
-            best, idx = lp.max(-1)
-            spoken = idx != model.config.BLANK_ID
+            lp = _log_softmax(logprobs[:, model.language_masks[code]])
+            best, idx = lp.max(-1), lp.argmax(-1)
+            spoken = idx != model.BLANK_ID
             if spoken.any():
                 scores[code] = float(best[spoken].mean())
         if not scores:
@@ -411,26 +390,116 @@ def _words(pieces: list[tuple[str, int]], offset: float, step: float) -> list[di
     return [w for w in words if w["w"].strip()]
 
 
-def _session_factory(encoder: str | None):
-    """onnxruntime sessions for the model's loader: the int8 encoder instead of
-    the float32 one, and no memory arena (it kept the largest input's buffers)."""
+def _log_softmax(x: np.ndarray) -> np.ndarray:
+    x = x.astype(np.float64)
+    x = x - x.max(-1, keepdims=True)
+    return x - np.log(np.exp(x).sum(-1, keepdims=True))
+
+
+def _mel_filterbank() -> np.ndarray:
+    """(257, 80): the preprocessor's mel filters (librosa's: Slaney mel scale and
+    area normalization, 0-8 kHz, 512-point FFT at 16 kHz). Within 7e-8 of the
+    matrix stored in the repo's preprocessor.ts (float32 rounding)."""
+
+    def to_mel(hz: float) -> float:
+        return 15 + np.log(hz / 1000) / (np.log(6.4) / 27) if hz >= 1000 else hz / (200 / 3)
+
+    mels = np.linspace(to_mel(0.0), to_mel(8000.0), 82)
+    hz = np.where(mels >= 15, 1000 * np.exp(np.log(6.4) / 27 * (mels - 15)), mels * (200 / 3))
+    ramps = hz[:, None] - np.fft.rfftfreq(512, 1 / 16000)[None, :]
+    fb = np.maximum(0, np.minimum(-ramps[:-2] / np.diff(hz)[:-1, None], ramps[2:] / np.diff(hz)[1:, None]))
+    return (fb * (2.0 / (hz[2:] - hz[:-2]))[:, None]).T
+
+
+_MEL = _mel_filterbank()
+# A 400-sample (25 ms) symmetric Hann window, centered in the 512-point frame.
+_WINDOW = np.pad(0.5 - 0.5 * np.cos(2 * np.pi * np.arange(400) / 399), 56)
+
+
+def features(audio: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The model's input from 16 kHz mono audio: ((1, 80, frames) float32, [frames]).
+
+    The repo's preprocessor.ts (NeMo's, traced to TorchScript) redone in NumPy:
+    0.97 pre-emphasis, |STFT|^2 (10 ms hop, reflect-padded), 80 mel bands,
+    log(x + 2^-24), then each band normalized to mean 0 / std 1 over the clip.
+    No dither (the traced copy has none). On 30 clips of the user's test meeting
+    it differs from the TorchScript by at most 1e-4 (mean ~1e-6; the features
+    have std 1); bit-identical isn't possible (torch's FFT is MKL's).
+
+    The text can still differ in places: the int8 encoder amplifies the
+    smallest input change. Gaussian noise of 1e-6 added to the TorchScript's
+    own features changed ~13% of the words on that meeting, and these features
+    changed as many (102 vs 101 edits in 784 words, 63 twelve-second windows),
+    and wrote no fewer words."""
+    x = np.asarray(audio, dtype=np.float32)
+    y = x.copy()
+    y[1:] -= x[:-1] * np.float32(0.97)
+    y = np.pad(y.astype(np.float64), 256, mode="reflect")
+    frames = np.lib.stride_tricks.sliding_window_view(y, 512)[::160]
+    power = np.abs(np.fft.rfft(frames * _WINDOW, axis=-1)) ** 2
+    feats = np.log(power @ _MEL + 2.0**-24).T
+    n = feats.shape[1]
+    feats -= feats.mean(axis=1, keepdims=True)
+    std = np.sqrt(np.maximum((feats**2).sum(axis=1, keepdims=True) / max(n - 1, 1), 2.0**-24))
+    return (feats / (std + 1e-5)).astype(np.float32)[None], np.array([n], dtype=np.int64)
+
+
+class Conformer:
+    """The model's ONNX parts, vocabularies and settings, read from its
+    downloaded folder without the repo's model_onnx.py (which needs torch and
+    transformers just to hold them)."""
+
+    # model_onnx.py's `IndicASRConfig` defaults, which its loader runs with: it
+    # never reads config.json, whose "SOS": 256 would be an Assamese letter.
+    # 5632 is the shared blank after the 22 languages' 22 x 256 tokens, which
+    # the RNNT decoder starts from. BLANK_ID is the blank's index within one
+    # language's 257 (`language_masks`).
+    BLANK_ID = 256
+    SOS = 5632
+    RNNT_MAX_SYMBOLS = 10
+    PRED_RNN_LAYERS = 2
+    PRED_RNN_HIDDEN_DIM = 640
+    FRAME_S = 0.08  # seconds per encoder frame
+
+    def __init__(self, snapshot: str, encoder: str | None) -> None:
+        self.assets = os.path.join(snapshot, "assets")
+        self.models = {
+            name: _session(encoder if name == "encoder" and encoder else os.path.join(self.assets, f"{name}.onnx"))
+            for name in ("encoder", "ctc_decoder", "rnnt_decoder", "joint_enc", "joint_pred", "joint_pre_net")
+        }
+        with open(os.path.join(self.assets, "vocab.json"), encoding="utf-8") as f:
+            self.vocab: dict[str, list[str]] = json.load(f)
+        with open(os.path.join(self.assets, "language_masks.json"), encoding="utf-8") as f:
+            self.language_masks = {k: np.array(v, dtype=bool) for k, v in json.load(f).items()}
+
+    def post_net(self, lang: str):
+        """The language's own last layer (one of 22, 0.7 MB each), loaded when first used."""
+        name = f"joint_post_net_{lang}"
+        if name not in self.models:
+            self.models[name] = _session(os.path.join(self.assets, f"{name}.onnx"))
+        return self.models[name]
+
+    def encode(self, audio: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """(encoder output (1, 1024, frames), [frames]) of 16 kHz mono audio."""
+        feats, length = features(audio)
+        return tuple(self.models["encoder"].run(["outputs", "encoded_lengths"], {"audio_signal": feats, "length": length}))
+
+
+def _session(path: str):
+    """An onnxruntime session without a memory arena (it kept the largest
+    input's buffers)."""
     import onnxruntime as ort
 
-    def session(path: str, providers=None):
-        if encoder and os.path.normpath(path).endswith(os.path.join("assets", "encoder.onnx")):
-            path = encoder
-        opts = ort.SessionOptions()
-        opts.enable_cpu_mem_arena = False
-        # onnxruntime would use every core; share them with the rest of the computer.
-        opts.intra_op_num_threads = int(os.environ.get("OMP_NUM_THREADS") or 2)
-        opts.inter_op_num_threads = 1
-        # Idle worker threads would otherwise spin, burning CPU between steps:
-        # measured ~9-11 cores busy while decoding with a 4-thread limit.
-        opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
-        opts.add_session_config_entry("session.inter_op.allow_spinning", "0")
-        return ort.InferenceSession(path, opts, providers=providers)
-
-    return session
+    opts = ort.SessionOptions()
+    opts.enable_cpu_mem_arena = False
+    # onnxruntime would use every core; share them with the rest of the computer.
+    opts.intra_op_num_threads = int(os.environ.get("OMP_NUM_THREADS") or 2)
+    opts.inter_op_num_threads = 1
+    # Idle worker threads would otherwise spin, burning CPU between steps:
+    # measured ~9-11 cores busy while decoding with a 4-thread limit.
+    opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    opts.add_session_config_entry("session.inter_op.allow_spinning", "0")
+    return ort.InferenceSession(path, opts, providers=["CPUExecutionProvider"])
 
 
 indic_asr = IndicASR()

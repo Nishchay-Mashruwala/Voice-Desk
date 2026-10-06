@@ -24,6 +24,8 @@ pub fn register_hotkey(app: &AppHandle, settings: &Settings) -> Result<(), Strin
     let gs = app.global_shortcut();
     gs.unregister_all().map_err(err)?;
     let mode = settings.dictation_mode.clone();
+    // Saving settings registers the shortcut again, so this stays current.
+    let meeting = settings.shortcut_starts == "meeting";
     let long_press = Duration::from_secs_f32(settings.long_press_s.clamp(0.5, 10.0));
     let keys = Arc::new(Mutex::new(KeyState::default()));
     gs.on_shortcut(settings.dictation_hotkey.as_str(), move |app, _shortcut, event| {
@@ -39,6 +41,10 @@ pub fn register_hotkey(app: &AppHandle, settings: &Settings) -> Result<(), Strin
             });
         };
         match (mode.as_str(), pressed) {
+            // Settings → "The shortcut starts": a meeting recording isn't held
+            // down like push-to-talk, so in that case a press starts/stops it.
+            ("hold", true) if meeting => act(session::shortcut),
+            ("hold", false) if meeting => {}
             // Push-to-talk: listen only while the keys are held.
             ("hold", true) => act(session::start),
             ("hold", false) => act(|app, st| {
@@ -52,7 +58,7 @@ pub fn register_hotkey(app: &AppHandle, settings: &Settings) -> Result<(), Strin
                 if k.last_press.is_some_and(|t| now - t <= DOUBLE_PRESS_WINDOW) {
                     k.last_press = None;
                     drop(k);
-                    act(session::toggle);
+                    act(session::shortcut);
                 } else {
                     k.last_press = Some(now);
                 }
@@ -69,7 +75,7 @@ pub fn register_hotkey(app: &AppHandle, settings: &Settings) -> Result<(), Strin
                     std::thread::sleep(long_press);
                     if keys.lock().unwrap().generation == generation {
                         let st = app.state::<Shared>().inner().clone();
-                        if let Err(e) = session::toggle(&app, &st) {
+                        if let Err(e) = session::shortcut(&app, &st) {
                             let _ = app.emit("session-notice", json!({ "message": e }));
                         }
                     }
@@ -79,7 +85,7 @@ pub fn register_hotkey(app: &AppHandle, settings: &Settings) -> Result<(), Strin
                 keys.lock().unwrap().generation += 1; // released early: cancel
             }
             // Default: press once to start, once to stop.
-            (_, true) => act(session::toggle),
+            (_, true) => act(session::shortcut),
             (_, false) => {}
         }
     })

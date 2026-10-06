@@ -30,7 +30,7 @@ def _worker_threads() -> int:
     return max(2, cores // 2)
 
 
-# Before numpy/torch/onnxruntime load: they size their thread pools from these.
+# Before numpy/onnxruntime load: they size their thread pools from these.
 THREADS = int(os.environ.get("VOICEDESK_THREADS") or _worker_threads())
 for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
     os.environ.setdefault(_var, str(THREADS))

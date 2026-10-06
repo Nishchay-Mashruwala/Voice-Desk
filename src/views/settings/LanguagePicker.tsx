@@ -1,7 +1,7 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
 import type { Settings } from "../../api";
 import { Check, External } from "../../icons";
-import { ENGINE_DOWNLOAD, gb } from "../../models";
+import { gb, INDIC_MODEL_GB } from "../../models";
 import type { SetSetting } from "./common";
 
 const INDIC_MODEL_URL = "https://huggingface.co/ai4bharat/indic-conformer-600m-multilingual";
@@ -72,8 +72,8 @@ export default function LanguagePicker({ s, set }: { s: Settings; set: SetSettin
             <option value="all">Translate both to English</option>
           </select>
           <span className="field-hint">
-            As spoken uses AI4Bharat IndicConformer, a model made for Indian languages (a {gb(ENGINE_DOWNLOAD.indic)} download on
-            first use, with your Hugging Face token after accepting its terms on huggingface.co). Translating uses Whisper.
+            As spoken uses AI4Bharat IndicConformer, a model made for Indian languages (a {gb(INDIC_MODEL_GB)} download on
+            first use, kept as 1.0 GB, with your Hugging Face token after accepting its terms on huggingface.co). Translating uses Whisper.
           </span>
         </div>
       )}

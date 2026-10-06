@@ -366,26 +366,55 @@ pub fn toggle(app: &AppHandle, st: &Shared) -> Result<(), String> {
         stop(app, st);
         Ok(())
     } else if st.meeting.lock().unwrap().is_some() {
-        // One press could be an accident: the first arms, a second within 3 s stops.
-        let armed = st.stop_armed.lock().unwrap().take().is_some_and(|t| t.elapsed() <= STOP_CONFIRM);
-        if !armed {
-            *st.stop_armed.lock().unwrap() = Some(Instant::now());
-            let _ = app.emit(
-                "session-notice",
-                json!({ "message": "Press the shortcut again to stop the meeting recording", "short": "Press again to stop" }),
-            );
-            return Ok(());
-        }
-        let (app, st) = (app.clone(), st.clone());
-        tauri::async_runtime::spawn(async move {
-            if let Err(e) = crate::meetings::end_meeting(&app, &st).await {
-                notice(&app, e);
-            }
-        });
+        confirm_meeting_stop(app, st);
         Ok(())
     } else {
         start(app, st)
     }
+}
+
+/// The keyboard shortcut. Settings → "The shortcut starts" chooses listening
+/// (`toggle`, above) or a meeting recording: press to start one (listening
+/// already on becomes its beginning; an offered call names it), press twice
+/// to stop. The tray and the mic button always start listening.
+pub fn shortcut(app: &AppHandle, st: &Shared) -> Result<(), String> {
+    if !shortcut_starts_meeting(st) {
+        return toggle(app, st);
+    }
+    if st.meeting.lock().unwrap().is_some() {
+        confirm_meeting_stop(app, st);
+        return Ok(());
+    }
+    if st.call_prompt.lock().unwrap().is_some() {
+        return crate::meetings::accept_call(app, st);
+    }
+    let started = crate::meetings::begin_meeting(app, st, "")?;
+    let message = started.warning.unwrap_or_else(|| "Recording a meeting".into());
+    let _ = app.emit("session-notice", json!({ "message": message, "short": "● Recording" }));
+    Ok(())
+}
+
+fn shortcut_starts_meeting(st: &Shared) -> bool {
+    st.db.settings().map(|s| s.shortcut_starts == "meeting").unwrap_or(false)
+}
+
+/// One press could be an accident: the first arms, a second within 3 s stops.
+fn confirm_meeting_stop(app: &AppHandle, st: &Shared) {
+    let armed = st.stop_armed.lock().unwrap().take().is_some_and(|t| t.elapsed() <= STOP_CONFIRM);
+    if !armed {
+        *st.stop_armed.lock().unwrap() = Some(Instant::now());
+        let _ = app.emit(
+            "session-notice",
+            json!({ "message": "Press the shortcut again to stop the meeting recording", "short": "Press again to stop" }),
+        );
+        return;
+    }
+    let (app, st) = (app.clone(), st.clone());
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = crate::meetings::end_meeting(&app, &st).await {
+            notice(&app, e);
+        }
+    });
 }
 
 /// Start listening (push-to-talk press too): during a call, record the meeting instead.

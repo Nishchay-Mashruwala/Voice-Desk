@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { api, useEvent, type Hardware, type InstallProgress, type SetupStatus } from "../../api";
 import { Download } from "../../icons";
-import { ENGINE_DOWNLOAD, gb, TASK_RUNTIME_GB, type ModelSpec } from "../../models";
+import { ENGINE_DOWNLOAD, gb, INDIC_MODEL_GB, TASK_RUNTIME_GB, type ModelSpec } from "../../models";
 import { toast } from "../../toast";
 import { ProgressBar } from "./common";
 
@@ -23,6 +23,7 @@ export default function GettingReady({
   needEngine,
   needIndic,
   needTaskAi,
+  taskModelReady,
   task,
   ensureSaved,
   onDone,
@@ -34,6 +35,8 @@ export default function GettingReady({
   /** Hindi/Gujarati were chosen after the engine was set up without them. */
   needIndic: boolean;
   needTaskAi: boolean;
+  /** The task model is already downloaded (only its runner is missing). */
+  taskModelReady: boolean;
   /** The task model that would be downloaded (the one picked in Settings). */
   task: ModelSpec;
   /** Save unsaved settings first, so the download is for what's picked on screen. False: saving failed. */
@@ -66,10 +69,14 @@ export default function GettingReady({
     else if (setup.installing && setup.install_progress) setProgress((p) => p ?? setup.install_progress);
   }, [running, setup.installing, setup.install_progress]);
 
+  // The engine is already on this computer, its setup just didn't finish:
+  // finishing it fetches only what's missing, so it isn't offered as a download.
+  const finishEngine = needEngine && setup.engine_partial;
   const engineGb = ENGINE_DOWNLOAD.base + (nvidia ? ENGINE_DOWNLOAD.nvidia : ENGINE_DOWNLOAD.cpu);
-  const taskGb = task.downloadGb + TASK_RUNTIME_GB;
+  // Only the parts not downloaded yet.
+  const taskGb = (taskModelReady ? 0 : task.downloadGb) + (setup.llm.installed ? 0 : TASK_RUNTIME_GB);
   const total =
-    (needEngine ? engineGb + (indic && indicChosen ? ENGINE_DOWNLOAD.indic : 0) : 0) +
+    (needEngine && !finishEngine ? engineGb + (indic && indicChosen ? ENGINE_DOWNLOAD.indic : 0) : 0) +
     (needIndic ? ENGINE_DOWNLOAD.indic : 0) +
     (needTaskAi ? taskGb : 0);
 
@@ -82,7 +89,9 @@ export default function GettingReady({
       // Saving may have changed what's needed (e.g. a different task model): ask again.
       const now = await api.setupStatus();
       const wantIndic = indicChosen && !!now.engine_packs && !now.engine_packs.indic;
-      if (!now.engine_installed) await api.engineInstall({ nvidia: nvidia && bigGpu, indic: indic && indicChosen });
+      // Finishing keeps the packs already on disk (and adds Hindi/Gujarati if chosen).
+      if (!now.engine_installed && now.engine_partial) await api.engineInstall({ nvidia: false, indic: indicChosen });
+      else if (!now.engine_installed) await api.engineInstall({ nvidia: nvidia && bigGpu, indic: indic && indicChosen });
       else if (wantIndic) await api.engineInstall({ nvidia: false, indic: true }); // keeps packs already installed
       if (!(now.llm.installed && now.llm.model_ready)) await api.llmPull();
       toast("Voice Desk is ready — it works offline from now on");
@@ -109,24 +118,34 @@ export default function GettingReady({
         interrupted, it continues where it stopped.
       </p>
       <ul className="small getting-ready-list">
-        {needEngine && <li>Speech engine and speech model — about {gb(engineGb)}</li>}
-        {needIndic && <li>Hindi/Gujarati written as spoken — about {gb(ENGINE_DOWNLOAD.indic)} (needs your Hugging Face token)</li>}
+        {finishEngine ? (
+          <li>Speech engine — already on this computer; finishing its setup downloads only what's missing</li>
+        ) : (
+          needEngine && <li>Speech engine and speech model — about {gb(engineGb)}</li>
+        )}
+        {needIndic && (
+          <li>
+            Hindi/Gujarati written as spoken — about {gb(ENGINE_DOWNLOAD.indic)}, then its {gb(INDIC_MODEL_GB)} model when first
+            used (needs your Hugging Face token)
+          </li>
+        )}
         {needTaskAi && (
           <li>
             Task AI ({task.name}) — about {gb(taskGb)}
           </li>
         )}
       </ul>
-      {needEngine && bigGpu && (
+      {needEngine && !finishEngine && bigGpu && (
         <label className="row small">
           <input type="checkbox" checked={nvidia} onChange={(e) => setNvidia(e.target.checked)} disabled={running} />
           Use the NVIDIA GPU for faster speech recognition (+{gb(ENGINE_DOWNLOAD.nvidia - ENGINE_DOWNLOAD.cpu)})
         </label>
       )}
-      {needEngine && indicChosen && (
+      {needEngine && !finishEngine && indicChosen && (
         <label className="row small">
           <input type="checkbox" checked={indic} onChange={(e) => setIndic(e.target.checked)} disabled={running} />
-          Hindi/Gujarati written as spoken (+{gb(ENGINE_DOWNLOAD.indic)}; needs your Hugging Face token)
+          Hindi/Gujarati written as spoken (+{gb(ENGINE_DOWNLOAD.indic)}, then a {gb(INDIC_MODEL_GB)} model when first used;
+          needs your Hugging Face token)
         </label>
       )}
       {running ? (
@@ -141,7 +160,7 @@ export default function GettingReady({
       ) : (
         <div className="row">
           <button className="primary" onClick={start}>
-            <Download size={14} /> {error ? "Try again" : "Download"} (about {gb(total)})
+            <Download size={14} /> {error ? "Try again" : total > 0 ? `Download (about ${gb(total)})` : "Finish setup"}
           </button>
           {error && <span className="small bad">{error}</span>}
         </div>

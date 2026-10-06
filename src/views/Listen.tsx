@@ -217,6 +217,8 @@ export default function ListenView({
         : mode === "long"
           ? `hold for ${settings?.long_press_s ?? 5}s`
           : "press";
+  // Settings → "The shortcut starts": a meeting recording instead of listening.
+  const shortcutMeeting = settings?.shortcut_starts === "meeting";
   const orbCls = session?.capturing ? "capturing listening" : state === "listening" ? "listening" : state;
 
   const commands = settings
@@ -236,8 +238,17 @@ export default function ListenView({
           Speak, and it <span className="gradient-text">writes</span>.
         </h1>
         <p>
-          Put your cursor anywhere and {how} <kbd>{hotkey}</kbd>. Each phrase is typed as soon as you pause — no need
-          to stop first.
+          {shortcutMeeting ? (
+            <>
+              Put your cursor anywhere and click the microphone. Each phrase is typed as soon as you pause. Your shortcut{" "}
+              <kbd>{hotkey}</kbd> records a meeting instead.
+            </>
+          ) : (
+            <>
+              Put your cursor anywhere and {how} <kbd>{hotkey}</kbd>. Each phrase is typed as soon as you pause — no need
+              to stop first.
+            </>
+          )}
         </p>
       </header>
 
@@ -255,11 +266,14 @@ export default function ListenView({
             )}
           </div>
           <p className="muted">
-            {!active && (
-              <>
-                Click the microphone or {how} <kbd>{hotkey}</kbd>.
-              </>
-            )}
+            {!active &&
+              (shortcutMeeting ? (
+                <>Click the microphone to start.</>
+              ) : (
+                <>
+                  Click the microphone or {how} <kbd>{hotkey}</kbd>.
+                </>
+              ))}
             {state === "starting" &&
               (download
                 ? `${downloadText(download)} (first use only) — speak anyway, nothing is lost.`

@@ -19,6 +19,9 @@ pub struct Settings {
     /// (double-press), "long" (hold for `long_press_s`), or "hold" (push-to-talk).
     pub dictation_mode: String,
     pub long_press_s: f32,
+    /// What the shortcut starts: "listen" (typing at the cursor) or "meeting"
+    /// (a meeting recording; listening already on becomes its start).
+    pub shortcut_starts: String,
     /// "paste" (clipboard + Ctrl+V, fast) or "type" (simulated keystrokes, slower but clipboard-free).
     pub insert_method: String,
     /// How long a pause (ms) ends a phrase and sends it to be typed.
@@ -82,6 +85,7 @@ impl Default for Settings {
             dictation_hotkey: "Ctrl+Shift+Space".into(),
             dictation_mode: "toggle".into(),
             long_press_s: 5.0,
+            shortcut_starts: "listen".into(),
             insert_method: "paste".into(),
             silence_ms: 700,
             assistant_name: "Jarvis".into(),
@@ -864,6 +868,13 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_saved_before_the_shortcut_choice_keep_listening() {
+        let old: Settings = serde_json::from_str(r#"{"dictation_hotkey": "Ctrl+Alt+D", "dictation_mode": "hold"}"#).unwrap();
+        assert_eq!(old.shortcut_starts, "listen");
+        assert_eq!(old.dictation_mode, "hold");
+    }
 
     fn db() -> Db {
         let dir = std::env::temp_dir().join(format!("voicedesk-test-{}-{}", std::process::id(), rand_suffix()));

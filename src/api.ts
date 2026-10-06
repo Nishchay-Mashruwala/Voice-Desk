@@ -8,6 +8,8 @@ export interface Settings {
   dictation_hotkey: string;
   dictation_mode: "toggle" | "double" | "long" | "hold";
   long_press_s: number;
+  /** What the keyboard shortcut starts: listening (typing) or a meeting recording. */
+  shortcut_starts: "listen" | "meeting";
   insert_method: "paste" | "type";
   silence_ms: number;
   assistant_name: string;
@@ -217,6 +219,9 @@ export interface InstallProgress {
 
 export interface SetupStatus {
   engine_installed: boolean;
+  /** The engine's Python and packages are already here; setup just didn't finish
+   * (finishing downloads only what's missing). Voice Desk finishes it at start. */
+  engine_partial: boolean;
   /** Optional packs of the first-run engine; null when not set up or in development. */
   engine_packs: { nvidia: boolean; indic: boolean } | null;
   engine: EngineStatus;

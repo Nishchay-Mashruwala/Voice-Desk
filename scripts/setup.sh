@@ -73,8 +73,8 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   uv pip install --python "$PY" -r engine/requirements-nvidia.txt -c engine/constraints.txt
 fi
 if [ "${VOICEDESK_INDIC:-0}" = "1" ]; then
-  echo "Adding Hindi/Gujarati support (~0.7 GB)..."
-  uv pip install --python "$PY" -r engine/requirements-indic.txt -c engine/constraints.txt --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match
+  echo "Adding Hindi/Gujarati support (~30 MB)..."
+  uv pip install --python "$PY" -r engine/requirements-indic.txt -c engine/constraints.txt
 fi
 ok "Speech engine ready"
 

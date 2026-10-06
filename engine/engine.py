@@ -13,11 +13,12 @@ Long-running sidecar spawned by the Tauri backend. Speaks JSON Lines:
 Only protocol messages go to stdout; all logging goes to stderr.
 
 Memory: Whisper lives on the GPU when there is one; voice ID (26 MB) and
-speaker detection (46 MB, see speakers.py) are small ONNX models on the CPU.
-PyTorch is only loaded for Hindi/Gujarati. Idle models are unloaded after a
+speaker detection (46 MB, see speakers.py) are small ONNX models on the CPU,
+and so is Hindi/Gujarati (IndicConformer, ~1 GB). Idle models are unloaded after a
 configurable time.
 
-  python engine.py --prefetch   downloads models ahead of time (used by setup)
+  python engine.py --prefetch [OPTIONS_JSON]   downloads the models these settings
+                                               use, if missing (used by setup)
 """
 
 from __future__ import annotations
@@ -186,29 +187,34 @@ def handle(req: dict) -> None:
             last_done = time.time()
 
 
-def prefetch() -> None:
-    """Download models ahead of time so the first run starts instantly."""
+def prefetch(options: dict) -> None:
+    """Download models ahead of time so the first run starts instantly. Only
+    what these settings (`options`: the app's "load" arguments) will load on
+    this computer, and only what isn't downloaded yet: the speech models are
+    the ones `load` would try, in its order (a GPU model only with the NVIDIA pack)."""
     import voiceprint as vp
 
-    from transcriber import cpu_model, cuda_usable
-
-    # Only what this computer will use: a GPU model only with the NVIDIA pack.
-    names = ["large-v3-turbo", "small"] if cuda_usable() else [cpu_model()]
+    model, device = options.get("model") or "auto", options.get("device") or "auto"
+    languages, translate = options.get("languages"), options.get("translate") or False
+    need = whisper_need(languages, translate)
+    names = list(dict.fromkeys(c[0] for c in Transcriber._candidates(model, device, need)))
     for name in names:
-        print(f"Downloading speech model '{name}'...", flush=True)
+        print(f"Getting speech model '{name}'...", flush=True)
         whisper_files(name)
-    print("Downloading voice-ID model...", flush=True)
+    print("Getting the voice-ID model...", flush=True)
     vp.model_file()
-    print("Downloading speaker-detection models...", flush=True)
+    print("Getting the speaker-detection models...", flush=True)
     speakers.model_paths()
     print("Checking the speech model loads...", flush=True)
-    transcriber.load()
+    transcriber.load(model, device, languages, translate)
     print(f"OK: '{transcriber.active_model}' runs on {transcriber.active_device}.", flush=True)
 
 
 def main() -> None:
     if "--prefetch" in sys.argv:
-        prefetch()
+        # --prefetch ['{"model": ..., "device": ..., "languages": [...], "translate": ...}']
+        at = sys.argv.index("--prefetch") + 1
+        prefetch(json.loads(sys.argv[at]) if at < len(sys.argv) else {})
         return
     isolate_protocol_pipes()
     threading.Thread(target=idle_watchdog, daemon=True).start()

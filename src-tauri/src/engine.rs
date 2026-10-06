@@ -65,13 +65,22 @@ impl Engine {
 
     pub fn is_installed(&self) -> bool {
         // Python set up on first run counts only once that setup finished.
-        let first_run_python = self.python == crate::engine_setup::python_exe();
-        self.python.exists() && self.script.exists() && (!first_run_python || crate::engine_setup::installed_packs(&self.script_dir()).is_some())
+        self.python.exists() && self.script.exists() && (!self.uses_first_run_python() || crate::engine_setup::installed_packs(&self.script_dir()).is_some())
+    }
+
+    /// Runs on the Python that first-run setup downloads (not a development .venv).
+    pub fn uses_first_run_python(&self) -> bool {
+        self.python == crate::engine_setup::python_exe()
+    }
+
+    /// First-run Python is on this computer, but its setup hasn't finished.
+    pub fn is_partly_installed(&self) -> bool {
+        self.uses_first_run_python() && crate::engine_setup::unfinished(&self.script_dir()).is_some()
     }
 
     /// Optional packs in the first-run Python (None: not set up yet, or a development .venv).
     pub fn packs(&self) -> Option<crate::engine_setup::Packs> {
-        (self.python == crate::engine_setup::python_exe()).then(|| crate::engine_setup::installed_packs(&self.script_dir())).flatten()
+        self.uses_first_run_python().then(|| crate::engine_setup::installed_packs(&self.script_dir())).flatten()
     }
 
     pub fn is_running(&self) -> bool {

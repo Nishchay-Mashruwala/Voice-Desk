@@ -217,11 +217,19 @@ impl Drop for Running<'_> {
 /// packs) and its models. Progress goes out as "engine-setup" events.
 #[tauri::command]
 async fn engine_install(app: AppHandle, st: State<'_, Shared>, packs: engine_setup::Packs) -> CmdResult<()> {
+    run_engine_setup(app, st.inner().clone(), packs).await
+}
+
+async fn run_engine_setup(app: AppHandle, st: Shared, packs: engine_setup::Packs) -> CmdResult<()> {
     let _running = Running::start(&st.installing, "Setup")?;
     let engine_dir = st.engine.script_dir();
     let http = downloads::client();
-    let (app2, st2) = (app.clone(), st.inner().clone());
-    let result = engine_setup::install(&http, &engine_dir, packs, move |step, pct, detail| {
+    // The same options warm_up_engine loads with: only the models they use are fetched.
+    let s = st.db.settings().unwrap_or_default();
+    let mut load_options = json!({ "model": s.whisper_model, "device": s.device });
+    session::merge_json(&mut load_options, s.language_options());
+    let (app2, st2) = (app.clone(), st.clone());
+    let result = engine_setup::install(&http, &engine_dir, packs, load_options, move |step, pct, detail| {
         let p = system::SetupProgress { step: step.into(), pct, detail: detail.into() };
         let _ = app2.emit("engine-setup", &p);
         *st2.install_progress.lock().unwrap() = Some(p);
@@ -229,8 +237,25 @@ async fn engine_install(app: AppHandle, st: State<'_, Shared>, packs: engine_set
     .await;
     *st.install_progress.lock().unwrap() = None;
     result.map_err(err)?;
-    warm_up_engine(app, st.inner().clone());
+    warm_up_engine(app, st.clone());
     Ok(())
+}
+
+/// At start: the speech engine's Python is already on this computer but its
+/// setup didn't finish (or an update changed its packages). Finish it in the
+/// background instead of offering the whole download again; only what's
+/// missing or changed is fetched. Otherwise start the engine as usual.
+fn finish_or_warm_up_engine(app: AppHandle, st: Shared) {
+    let unfinished = st.engine.uses_first_run_python().then(|| engine_setup::unfinished(&st.engine.script_dir())).flatten();
+    let Some(packs) = unfinished else { return warm_up_engine(app, st) };
+    eprintln!("[setup] the speech engine is on this computer but its setup didn't finish: finishing it");
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = run_engine_setup(app.clone(), st.clone(), packs).await {
+            eprintln!("[setup] couldn't finish the speech engine setup: {e}");
+            // Settings then offers "Finish setup" (engine_partial).
+            warm_up_engine(app, st);
+        }
+    });
 }
 
 /// Search recordings, meetings and tasks.
@@ -571,7 +596,7 @@ pub fn run() {
                 copy_last_dictation(app.handle());
             }
             overlay::init(app.handle());
-            warm_up_engine(app.handle().clone(), state.clone());
+            finish_or_warm_up_engine(app.handle().clone(), state.clone());
             compress_old_recordings(state.clone());
             // The task AI starts only while finding tasks (and stops a minute later).
             drop(state);

@@ -4,7 +4,7 @@
 # in); the ranges here only say what the code needs.
 # Optional packs, installed only where they help:
 #   requirements-nvidia.txt  NVIDIA GPU speed-up for Whisper (~2 GB)
-#   requirements-indic.txt   Hindi/Gujarati written as spoken (PyTorch, ~0.7 GB)
+#   requirements-indic.txt   Hindi/Gujarati written as spoken (~30 MB, model on first use)
 faster-whisper>=1.2
 ctranslate2>=4.5  # Whisper's inference library (imported directly for device checks)
 huggingface_hub>=1.0  # model downloads

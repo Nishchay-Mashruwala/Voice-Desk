@@ -11,7 +11,7 @@
 param(
   [switch]$NoShortcut,
   [switch]$SkipBuild,
-  [switch]$Indic  # also install Hindi/Gujarati support (PyTorch, ~0.7 GB)
+  [switch]$Indic  # also install Hindi/Gujarati support (~30 MB; its 2.4 GB model downloads on first use)
 )
 
 $ErrorActionPreference = "Stop"
@@ -81,21 +81,19 @@ if (-not $engineOk) {
 }
 Info "Installing speech packages (first time: a few minutes)..."
 # engine\constraints.txt pins the exact, tested versions (see README -> Releases).
-function PipInstall($file, $extra) {
+function PipInstall($file) {
   $pin = @("-c", "engine\constraints.txt")
-  # Like pip, let uv take each package from whichever index has the pinned version.
-  $uvx = if ($extra -contains "--index-url") { @("--index-strategy", "unsafe-best-match") } else { @() }
-  if (Has "uv") { uv pip install --python $Py -r $file @pin @extra @uvx } else { & $Py -m pip install -q -r $file @pin @extra }
+  if (Has "uv") { uv pip install --python $Py -r $file @pin } else { & $Py -m pip install -q -r $file @pin }
   if ($LASTEXITCODE -ne 0) { Fail "Installing $file failed." }
 }
-PipInstall "engine\requirements.txt" @()
+PipInstall "engine\requirements.txt"
 if (Has "nvidia-smi") {
   Info "NVIDIA GPU found: adding GPU speed-up (~2 GB)..."
-  PipInstall "engine\requirements-nvidia.txt" @()
+  PipInstall "engine\requirements-nvidia.txt"
 }
 if ($Indic) {
-  Info "Adding Hindi/Gujarati support (~0.7 GB)..."
-  PipInstall "engine\requirements-indic.txt" @("--index-url", "https://download.pytorch.org/whl/cpu", "--extra-index-url", "https://pypi.org/simple")
+  Info "Adding Hindi/Gujarati support (~30 MB)..."
+  PipInstall "engine\requirements-indic.txt"
 }
 Ok "Speech engine ready"
 

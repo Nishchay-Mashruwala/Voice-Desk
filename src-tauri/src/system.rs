@@ -38,6 +38,9 @@ pub struct SetupProgress {
 #[derive(Serialize)]
 pub struct SetupStatus {
     pub engine_installed: bool,
+    /// The engine's Python and packages are already here, setup just didn't
+    /// finish: finishing it downloads only what's missing.
+    pub engine_partial: bool,
     /// Optional packs of the first-run engine (None: not set up, or a development .venv).
     pub engine_packs: Option<crate::engine_setup::Packs>,
     pub engine: Value,
@@ -59,6 +62,7 @@ pub async fn setup_status(st: State<'_, Shared>) -> CmdResult<SetupStatus> {
     let engine = st.engine_status.lock().unwrap().clone();
     Ok(SetupStatus {
         engine_installed: st.engine.is_installed(),
+        engine_partial: st.engine.is_partly_installed(),
         engine_packs: st.engine.packs(),
         engine,
         name_set: !s.user_name.trim().is_empty(),
