@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, type DataPaths, type ModelInfo, type Usage } from "../../api";
+import { api, type DataPaths, type DiskUsage, type ModelInfo, type Usage } from "../../api";
 import { confirmDialog } from "../../confirm";
 import { Folder, Trash } from "../../icons";
 import { gb } from "../../models";
@@ -40,6 +40,37 @@ export function MemoryNow() {
             GPU memory {gb(u.gpu_used_gb)} of {gb(u.gpu_total_gb)}
           </span>
         )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Disk space Voice Desk takes: the app, its engines, the downloaded models and
+ * your data. Measured when shown and when `models` changes (a model deleted).
+ */
+export function DiskNow({ models }: { models: ModelInfo[] | null }) {
+  const [d, setD] = useState<DiskUsage | null>(null);
+  useEffect(() => {
+    let alive = true;
+    api
+      .diskUsage()
+      .then((x) => alive && setD(x))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [models]);
+  if (!d) return null;
+  const total = d.app_gb + d.engines_gb + d.models_gb + d.data_gb;
+  return (
+    <div className="full usage">
+      <span className="field-label">On disk · {gb(total)}</span>
+      <div className="usage-row">
+        <span>App {gb(d.app_gb)}</span>
+        <span title="The speech engine's Python and packages, and the task AI's runner">Engines {gb(d.engines_gb)}</span>
+        <span>Models {gb(d.models_gb)}</span>
+        <span title="Database, recordings, voice profile">Your data {gb(d.data_gb)}</span>
       </div>
     </div>
   );

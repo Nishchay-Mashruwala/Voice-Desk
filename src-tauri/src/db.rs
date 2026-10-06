@@ -59,6 +59,9 @@ pub struct Settings {
     pub device: String,
     /// Words Whisper should spell correctly (names, jargon).
     pub vocabulary: String,
+    /// Words and phrases left out of every transcript ("umm, uh, the the"),
+    /// comma or line separated (see omit.rs).
+    pub omit_words: String,
     /// Free the speech engine's memory after this many idle minutes (0 = never).
     pub unload_after_min: u32,
     /// Delete recordings, dictation and meetings (not their text), after this many days (0 = keep forever).
@@ -103,6 +106,7 @@ impl Default for Settings {
             whisper_model: "auto".into(),
             device: "auto".into(),
             vocabulary: String::new(),
+            omit_words: String::new(),
             unload_after_min: 10,
             keep_audio_days: 30,
             close_to_tray: false,

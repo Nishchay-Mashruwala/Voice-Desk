@@ -28,6 +28,8 @@ export interface Settings {
   /** "auto" | "cuda" (first NVIDIA GPU) | "cuda:N" (that GPU) | "cpu". Applies to speech and the task AI. */
   device: string;
   vocabulary: string;
+  /** Words and phrases left out of every transcript ("umm, uh, the the"). */
+  omit_words: string;
   unload_after_min: number;
   keep_audio_days: number;
   close_to_tray: boolean;
@@ -129,6 +131,16 @@ export interface Usage {
   task_ai_gb: number;
   gpu_used_gb: number | null;
   gpu_total_gb: number | null;
+}
+
+/** Disk space Voice Desk takes, in GB. */
+export interface DiskUsage {
+  app_gb: number;
+  /** The speech engine's Python and packages, and the task AI's runner. */
+  engines_gb: number;
+  models_gb: number;
+  /** Database, recordings, voice profile. */
+  data_gb: number;
 }
 
 export interface SearchHit {
@@ -268,6 +280,7 @@ export const api = {
   hardwareInfo: () => invoke<Hardware>("hardware_info"),
   resourceUsage: () => invoke<Usage>("resource_usage"),
   modelsInfo: () => invoke<ModelInfo[]>("models_info"),
+  diskUsage: () => invoke<DiskUsage>("disk_usage"),
   search: (query: string) => invoke<SearchHit[]>("search_all", { query }),
   engineInstall: (packs: { nvidia: boolean; indic: boolean }) => invoke<void>("engine_install", { packs }),
   renameSpeaker: (meetingId: number, from: string, to: string, remember: boolean) =>

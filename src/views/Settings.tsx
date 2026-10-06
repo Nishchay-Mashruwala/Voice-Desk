@@ -12,7 +12,7 @@ import GettingReady from "./settings/GettingReady";
 import HotkeyInput from "./settings/HotkeyInput";
 import LanguagePicker, { HfToken } from "./settings/LanguagePicker";
 import ModelPicker from "./settings/ModelPicker";
-import { DataFolders, DownloadedModels, MemoryNow } from "./settings/Storage";
+import { DataFolders, DiskNow, DownloadedModels, MemoryNow } from "./settings/Storage";
 import VoiceEnrollment from "./settings/VoiceSetup";
 
 /** What App needs to stop you leaving Settings with unsaved edits. */
@@ -444,6 +444,12 @@ export default function SettingsView({
             <Field label="Vocabulary" hint="Names and jargon to spell right, comma separated. Your name and the assistant name are included automatically.">
               <input value={s.vocabulary} onChange={(e) => set("vocabulary", e.target.value)} placeholder="Priya, Tauri, OKRs" />
             </Field>
+            <Field
+              label="Leave out"
+              hint="Words and phrases never written down — in typed text, Listen history and meeting transcripts — comma separated. Whole words only, any capitals; a repeated word (“the the”) becomes one. Applies to what you say from now on."
+            >
+              <input value={s.omit_words} onChange={(e) => set("omit_words", e.target.value)} placeholder="umm, uh, the the" />
+            </Field>
             {hw && (
               <ModelPicker
                 label="Accuracy (speech model)"
@@ -467,6 +473,7 @@ export default function SettingsView({
               <input type="number" min={0} value={s.keep_audio_days} onChange={(e) => set("keep_audio_days", Math.max(0, Number(e.target.value)))} />
             </Field>
             <MemoryNow />
+            <DiskNow models={models} />
             <DownloadedModels models={models} onChanged={refreshModels} />
             <DataFolders />
             <Toggle

@@ -348,7 +348,7 @@ fn tick(app: &AppHandle, st: &Shared, w: &mut Watch) {
         .collect();
     let call = if settings.detect_meetings { calls.first().cloned() } else { None };
 
-    watch_meeting(app, st, w, &held, settings.auto_stop_meetings);
+    watch_meeting(app, st, w, &held, &calls, settings.auto_stop_meetings);
 
     // The offer.
     let recording = st.meeting.lock().unwrap().is_some();
@@ -398,10 +398,23 @@ fn tick(app: &AppHandle, st: &Shared, w: &mut Watch) {
     }
 }
 
+/// The call a meeting recording belongs to. One started before its call (from
+/// the shortcut before joining, or with call offers off) takes the first call
+/// seen while it records, so it still ends when that call does.
+pub fn meeting_call(current: Option<String>, calls: &[Call]) -> Option<String> {
+    current.or_else(|| calls.first().map(|c| c.key.clone()))
+}
+
 /// End the meeting when its call ended or everyone has been quiet too long.
-fn watch_meeting(app: &AppHandle, st: &Shared, w: &mut Watch, held: &HashSet<String>, auto_stop: bool) {
-    let (call_key, loud) = match st.meeting.lock().unwrap().as_ref() {
+fn watch_meeting(app: &AppHandle, st: &Shared, w: &mut Watch, held: &HashSet<String>, calls: &[Call], auto_stop: bool) {
+    let (call_key, loud) = match st.meeting.lock().unwrap().as_mut() {
         Some(m) => {
+            if m.call_key.is_none() {
+                m.call_key = meeting_call(None, calls);
+                if let Some(c) = calls.first() {
+                    eprintln!("[calls] the meeting recording belongs to the {} call: it ends with it", c.app);
+                }
+            }
             let level = m.mic.level().max(m.system.as_ref().map_or(0.0, |s| s.level()));
             (Some(m.call_key.clone()), level >= SOUND_LEVEL)
         }
@@ -1277,6 +1290,19 @@ mod tests {
         assert_eq!(check_meeting(Some(s(15)), s(10)), MeetingCheck::CallEnded);
         assert_eq!(check_meeting(None, s(179)), MeetingCheck::KeepGoing);
         assert_eq!(check_meeting(None, s(180)), MeetingCheck::Quiet);
+    }
+
+    #[test]
+    fn meetings_started_before_their_call_take_it_on() {
+        let zoom = Call { key: "zoom".into(), app: "Zoom" };
+        let teams = Call { key: "teams".into(), app: "Teams" };
+        // Started before joining: no call yet, then the call that starts.
+        assert_eq!(meeting_call(None, &[]), None);
+        assert_eq!(meeting_call(None, std::slice::from_ref(&zoom)), Some("zoom".into()));
+        // Already tied to a call: another call starting doesn't change it.
+        assert_eq!(meeting_call(Some("zoom".into()), &[teams, zoom]), Some("zoom".into()));
+        // Ended for good: tied to Zoom, Zoom released the mic → "call ended".
+        assert_eq!(check_meeting(Some(CALL_END_GRACE), Duration::ZERO), MeetingCheck::CallEnded);
     }
 
     #[test]

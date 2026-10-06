@@ -244,6 +244,56 @@ pub async fn models_info(st: State<'_, Shared>) -> CmdResult<Vec<ModelInfo>> {
     Ok(out)
 }
 
+/// Disk space Voice Desk takes (Settings -> Storage), in GB.
+#[derive(Serialize)]
+pub struct DiskUsage {
+    /// The installed program.
+    pub app_gb: f64,
+    /// The speech engine's Python and packages, and the task AI's runner.
+    pub engines_gb: f64,
+    /// Downloaded models (the "Downloaded models" list).
+    pub models_gb: f64,
+    /// Database, recordings, voice profile.
+    pub data_gb: f64,
+}
+
+/// The installed program's size: the .app on a Mac, the AppImage, or the
+/// program and its resources (in development only the program file).
+fn app_size(app: &AppHandle) -> u64 {
+    use tauri::Manager;
+    let Ok(exe) = std::env::current_exe() else { return 0 };
+    if cfg!(debug_assertions) {
+        return size_of(&exe);
+    }
+    if let Some(bundle) = exe.ancestors().find(|p| p.extension().is_some_and(|e| e == "app")) {
+        return size_of(bundle);
+    }
+    if let Some(image) = std::env::var_os("APPIMAGE") {
+        return size_of(std::path::Path::new(&image));
+    }
+    let Some(exe_dir) = exe.parent() else { return size_of(&exe) };
+    match app.path().resource_dir() {
+        // Linux packages: the program in /usr/bin, its resources in /usr/lib/<app>.
+        Ok(res) if !res.starts_with(exe_dir) => size_of(&exe) + size_of(&res),
+        // Windows: the install folder holds both.
+        _ => size_of(exe_dir),
+    }
+}
+
+#[tauri::command]
+pub async fn disk_usage(app: AppHandle, st: State<'_, Shared>) -> CmdResult<DiskUsage> {
+    let models_gb = models_info(st.clone()).await?.iter().map(|m| m.size_gb).sum();
+    let data_dir = st.data_dir.clone();
+    // Thousands of files (the engine's packages): off the async threads.
+    let (app_bytes, engines, data) = tauri::async_runtime::spawn_blocking(move || {
+        let base = crate::downloads::base_dir();
+        (app_size(&app), size_of(&base.join("runtime")) + size_of(&base.join("llama")), size_of(&data_dir))
+    })
+    .await
+    .map_err(err)?;
+    Ok(DiskUsage { app_gb: app_bytes as f64 / 1e9, engines_gb: engines as f64 / 1e9, models_gb, data_gb: data as f64 / 1e9 })
+}
+
 /// Delete a downloaded model the current settings don't use. It downloads again
 /// by itself if a later setting needs it.
 #[tauri::command]

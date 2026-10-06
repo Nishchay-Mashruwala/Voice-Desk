@@ -82,6 +82,8 @@ async fn run(app: &AppHandle, st: &Shared, id: i64, input: Input) -> Result<usiz
         crate::session::merge_json(&mut args, settings.language_options());
         let res = st.engine.request("meeting", args, Some(on_event)).await.map_err(err)?;
         let segments: Vec<Segment> = serde_json::from_value(res["segments"].clone()).map_err(err)?;
+        // Words the user leaves out ("umm"); live captures were already filtered.
+        let segments = crate::omit::Omit::new(&settings.omit_words).segments(segments);
         let duration = res["duration"].as_f64().unwrap_or(0.0);
         st.db.save_transcript(id, &segments, duration).map_err(err)?;
     }

@@ -575,6 +575,7 @@ fn handle_utterance(app: &AppHandle, st: &Shared, ev: &Value) {
     let is_me = if has_profile { score.is_some_and(|s| s >= VOICE_THRESHOLD) } else { true };
     let (start, end) = (ev["start"].as_f64().unwrap_or(0.0), ev["end"].as_f64().unwrap_or(0.0));
 
+    let omit = crate::omit::Omit::new(&settings.omit_words);
     let mut heard = Vec::new();
     for part in ev["parts"].as_array().into_iter().flatten() {
         if part["type"] == "command" {
@@ -589,7 +590,9 @@ fn handle_utterance(app: &AppHandle, st: &Shared, ev: &Value) {
             continue;
         }
 
-        let text = part["text"].as_str().unwrap_or("").trim().to_string();
+        // Words the user leaves out ("umm"): gone from the typed text, history and captures alike.
+        let text = omit.text(part["text"].as_str().unwrap_or("").trim());
+        let part_words = omit.json_words(part["words"].as_array().cloned().unwrap_or_default());
         if text.is_empty() {
             continue;
         }
@@ -605,7 +608,7 @@ fn handle_utterance(app: &AppHandle, st: &Shared, ev: &Value) {
                             let at = |v: &Value| (v.as_f64().unwrap_or(0.0) - cap.start_s).max(0.0);
                             let words = part["words"]
                                 .as_array()
-                                .map(|ws| ws.iter().map(|w| Word { w: w["w"].as_str().unwrap_or("").into(), s: at(&w["s"]), e: at(&w["e"]) }).collect());
+                                .map(|_| part_words.iter().map(|w| Word { w: w["w"].as_str().unwrap_or("").into(), s: at(&w["s"]), e: at(&w["e"]) }).collect());
                             cap.me.push(Segment {
                                 start: (start - cap.start_s).max(0.0),
                                 end: (end - cap.start_s).max(0.0),
@@ -626,7 +629,7 @@ fn handle_utterance(app: &AppHandle, st: &Shared, ev: &Value) {
                     };
                     let status = action.label();
                     s.heard.push(text.clone());
-                    for w in part["words"].as_array().into_iter().flatten() {
+                    for w in &part_words {
                         let mut w = w.clone();
                         w["st"] = json!(status);
                         s.words.push(w);

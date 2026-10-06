@@ -10,6 +10,7 @@ mod jumplist;
 mod llm;
 mod meetings;
 mod meeting_detect;
+mod omit;
 mod overlay;
 mod pipeline;
 mod search;
@@ -688,6 +689,7 @@ pub fn run() {
             system::hardware_info,
             system::resource_usage,
             system::models_info,
+            system::disk_usage,
             system::delete_model,
             meetings::dictation_to_meeting,
             meetings::meeting_to_dictation,

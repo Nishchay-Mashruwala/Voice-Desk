@@ -312,7 +312,9 @@ pub async fn dictation_find_tasks(app: AppHandle, st: State<'_, Shared>, id: i64
     let duration = d.duration_ms as f64 / 1000.0;
     let words = serde_json::from_value(d.words).ok();
     let segment = Segment { start: 0.0, end: duration, speaker: "Me".into(), text: d.text, words };
-    st.db.save_transcript(meeting_id, &[segment], duration).map_err(err)?;
+    // Recordings from before a word was left out still have it.
+    let omit = crate::omit::Omit::new(&st.db.settings().map_err(err)?.omit_words);
+    st.db.save_transcript(meeting_id, &omit.segments(vec![segment]), duration).map_err(err)?;
     pipeline::process(app, st.inner().clone(), meeting_id, pipeline::Input::Reextract).await
 }
 
