@@ -154,7 +154,7 @@ pub struct ModelInfo {
     pub id: String,
     pub name: String,
     pub size_gb: f64,
-    /// The current settings use it (or might, as a fallback): not deletable.
+    /// The current settings use it (or might, as a fallback).
     pub in_use: bool,
 }
 
@@ -294,14 +294,27 @@ pub async fn disk_usage(app: AppHandle, st: State<'_, Shared>) -> CmdResult<Disk
     Ok(DiskUsage { app_gb: app_bytes as f64 / 1e9, engines_gb: engines as f64 / 1e9, models_gb, data_gb: data as f64 / 1e9 })
 }
 
-/// Delete a downloaded model the current settings don't use. It downloads again
-/// by itself if a later setting needs it.
+/// Delete a downloaded model. One the current settings use is allowed too: the
+/// speech engine or task AI holding it is stopped first (Windows won't delete a
+/// file that's open), and it downloads again when next needed.
 #[tauri::command]
 pub async fn delete_model(st: State<'_, Shared>, id: String) -> CmdResult<()> {
     let models = models_info(st.clone()).await?;
     let m = models.iter().find(|m| m.id == id).ok_or("That model is no longer there")?;
     if m.in_use {
-        return Err("Your current settings use this model".into());
+        let busy = st.session.lock().unwrap().is_some()
+            || st.meeting.lock().unwrap().is_some()
+            || st.processing.load(Ordering::Relaxed) > 0
+            || st.pulling.load(Ordering::Relaxed);
+        if busy {
+            return Err("It's in use right now — try again when the recording has finished".into());
+        }
+        if id.ends_with(".gguf") {
+            st.llm.shutdown();
+        } else {
+            st.engine.shutdown();
+            *st.models_in_use.lock().unwrap() = None;
+        }
     }
     let path = match id.split_once(':') {
         Some(("hf", folder)) => data_paths(st.clone()).speech_models.join(folder),
@@ -312,7 +325,16 @@ pub async fn delete_model(st: State<'_, Shared>, id: String) -> CmdResult<()> {
     if id.contains("..") || id.contains(['/', '\\']) {
         return Err("Unknown model".into());
     }
-    let res = if path.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+    let remove = || if path.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+    let mut res = remove();
+    // A process just stopped lets go of its files a moment later.
+    for _ in 0..10 {
+        if res.is_ok() || !m.in_use {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        res = remove();
+    }
     res.map_err(|e| format!("Couldn't delete it: {e}"))
 }
 

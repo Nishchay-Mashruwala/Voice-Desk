@@ -77,15 +77,20 @@ export function DiskNow({ models }: { models: ModelInfo[] | null }) {
 }
 
 /**
- * Downloaded models with their size; ones the current settings don't use can
- * be deleted. The list comes from Settings (fetched once, shared with the model pickers).
+ * Downloaded models with their size, each deletable (ones the current settings
+ * use with a stronger warning). The list comes from Settings (fetched once, shared with the model pickers).
  */
 export function DownloadedModels({ models, onChanged }: { models: ModelInfo[] | null; onChanged: () => void }) {
   const [busy, setBusy] = useState<string | null>(null);
   const remove = async (m: ModelInfo) => {
+    const again = m.id.endsWith(".gguf")
+      ? "You'll need to download the task AI again to find tasks."
+      : "It downloads again the next time you talk, which takes a while.";
     const ok = await confirmDialog({
       title: `Delete ${m.name}?`,
-      message: `Frees ${gb(m.size_gb)}. If a later setting needs it, it downloads again by itself.`,
+      message: m.in_use
+        ? `Frees ${gb(m.size_gb)}, but your current settings use it. ${again}`
+        : `Frees ${gb(m.size_gb)}. If a later setting needs it, it downloads again by itself.`,
     });
     if (!ok) return;
     setBusy(m.id);
@@ -113,13 +118,10 @@ export function DownloadedModels({ models, onChanged }: { models: ModelInfo[] | 
           <div key={m.id} className="model-row">
             <span className="grow">{m.name}</span>
             <span className="small muted">{gb(m.size_gb)}</span>
-            {m.in_use ? (
-              <span className="badge ok">In use</span>
-            ) : (
-              <button className="ghost danger" disabled={busy !== null} onClick={() => remove(m)}>
-                {busy === m.id ? <span className="spinner dark" /> : <Trash size={14} />} Delete
-              </button>
-            )}
+            {m.in_use && <span className="badge ok">In use</span>}
+            <button className="ghost danger" disabled={busy !== null} onClick={() => remove(m)}>
+              {busy === m.id ? <span className="spinner dark" /> : <Trash size={14} />} Delete
+            </button>
           </div>
         ))}
       </div>
