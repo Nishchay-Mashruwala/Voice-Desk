@@ -24,12 +24,12 @@ jobs:
           python-version: "3.12"
 
       - name: Versions match the tag, every module is committed
-        run: python scripts/check-release.py ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: python desktop/scripts/check-release.py ${{ github.ref_type == 'tag' && github.ref_name || '' }}
 
       # The engine's own packages, pinned as friends get them (the chunking tests
       # use faster-whisper's speech detector). No models are downloaded.
       - name: Engine tests
-        working-directory: engine
+        working-directory: desktop/backend/engine
         run: |
           python -m pip install -r requirements.txt -c constraints.txt
           python test_commands.py
@@ -45,19 +45,22 @@ jobs:
         with:
           node-version: 22
           cache: npm
+          cache-dependency-path: desktop/frontend/package-lock.json
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri
+          workspaces: desktop/backend
 
-      # The Tauri crate embeds the built frontend (dist/), so build it first.
+      # The Tauri crate embeds the built frontend (desktop/frontend/dist/), so build it first.
       - run: npm ci
+        working-directory: desktop/frontend
       - run: npm run build
+        working-directory: desktop/frontend
 
       - name: cargo test
-        working-directory: src-tauri
+        working-directory: desktop/backend
         run: cargo test
 
   build:
@@ -87,6 +90,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
+          cache-dependency-path: desktop/frontend/package-lock.json
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -94,9 +98,10 @@ jobs:
 
       - uses: swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri
+          workspaces: desktop/backend
 
       - run: npm ci
+        working-directory: desktop/frontend
 
       - uses: tauri-apps/tauri-action@v0
         env:
@@ -112,6 +117,8 @@ jobs:
           # latest.json: installed copies find updates here.
           includeUpdaterJson: true
           args: ${{ matrix.args }}
+          # The Tauri CLI pointed at desktop/backend/app (see desktop/frontend/tauri.mjs).
+          tauriScript: node desktop/frontend/tauri.mjs
 
       # Manual runs make no release: keep the installers as downloadable artifacts.
       - name: Upload installers
@@ -120,6 +127,6 @@ jobs:
         with:
           name: voice-desk-${{ runner.os }}
           path: |
-            src-tauri/target/release/bundle/
-            src-tauri/target/*/release/bundle/
+            desktop/backend/target/release/bundle/
+            desktop/backend/target/*/release/bundle/
           if-no-files-found: error

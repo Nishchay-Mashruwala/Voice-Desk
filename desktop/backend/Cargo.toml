@@ -1,0 +1,13 @@
+# The Rust half of the backend: `core` (no desktop code; could run on a
+# server) and `desktop` (the Tauri app). The speech engine is Python, in engine/.
+[workspace]
+members = ["core", "app"]
+resolver = "2"
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

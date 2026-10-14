@@ -29,8 +29,9 @@ __pycache__
 *.pyc
 
 # Rust / Tauri
-src-tauri/target
-src-tauri/gen/schemas
+desktop/backend/target
+desktop/backend/app/target
+desktop/backend/app/gen/schemas
 
 # Tauri bundle: VC++ runtime DLLs copied in by build.rs at build time
-src-tauri/redist/
+desktop/backend/app/redist/
