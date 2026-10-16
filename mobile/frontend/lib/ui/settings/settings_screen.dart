@@ -2,13 +2,16 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 
-import 'package:mobile_backend/engine/models/speech_model.dart';
 import 'package:mobile_backend/engine/permissions.dart';
 import 'package:mobile_backend/engine/pipeline/processor.dart';
 import 'package:mobile_backend/engine/speech/your_words.dart';
 
 import '../theme.dart';
-import '../wording.dart';
+import 'credits_screen.dart';
+import 'speech_card.dart';
+import 'storage_screen.dart';
+import 'tasks_card.dart';
+import 'people_screen.dart';
 
 final appVersionProvider = FutureProvider<String>((ref) async => (await PackageInfo.fromPlatform()).version);
 
@@ -76,6 +79,15 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> with WidgetsBin
         Text('Settings', style: Theme.of(context).textTheme.headlineSmall),
         heading('You and your words'),
         const Card(child: _YourWordsCard()),
+        const SizedBox(height: 8),
+        Card(
+          child: ListTile(
+            title: const Text('People'),
+            subtitle: Text('Your voice, and the voices recognised in recordings', style: TextStyle(color: vd.muted)),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const PeopleScreen())),
+          ),
+        ),
         heading('Permissions'),
         Card(
           child: Column(
@@ -94,8 +106,17 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> with WidgetsBin
             ],
           ),
         ),
-        heading('Speech model'),
-        Card(child: _SpeechModelTile(model: ref.watch(speechModelProvider))),
+        heading('Speech'),
+        const Card(child: SpeechCard()),
+        heading('Storage'),
+        Card(
+          child: ListTile(
+            title: const Text('Storage'),
+            subtitle: Text('Recordings, models and free space', style: TextStyle(color: vd.muted)),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const StorageScreen())),
+          ),
+        ),
         heading('Processing'),
         Card(
           child: SwitchListTile(
@@ -105,6 +126,8 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> with WidgetsBin
             onChanged: (on) => ref.read(onlyWhileChargingProvider.notifier).set(on),
           ),
         ),
+        const SizedBox(height: 8),
+        const Card(child: TasksCard()),
         heading('About'),
         Card(
           child: ListTile(
@@ -118,34 +141,14 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> with WidgetsBin
             subtitle: Text('Everything stays on this phone.', style: TextStyle(color: vd.muted)),
           ),
         ),
-      ],
-    );
-  }
-}
-
-/// The English speech model: its size, Download / Delete, or the download's progress.
-class _SpeechModelTile extends ConsumerWidget {
-  const _SpeechModelTile({required this.model});
-  final SpeechModelState model;
-
-  @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final notifier = ref.read(speechModelProvider.notifier);
-    return ListTile(
-      title: const Text('English speech model · 105 MB'),
-      subtitle: model.phase == SpeechModelPhase.missing
-          ? null
-          : Text(speechModelText(model), style: TextStyle(color: context.vd.muted)),
-      trailing: switch (model.phase) {
-        SpeechModelPhase.ready => TextButton(onPressed: notifier.delete, child: const Text('Delete')),
-        SpeechModelPhase.downloading => const SizedBox(
-          width: 20,
-          height: 20,
-          child: CircularProgressIndicator(strokeWidth: 2),
+        Card(
+          child: ListTile(
+            title: const Text('Licences & credits'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const CreditsScreen())),
+          ),
         ),
-        SpeechModelPhase.failed => FilledButton(onPressed: notifier.download, child: const Text('Try again')),
-        SpeechModelPhase.missing => FilledButton(onPressed: notifier.download, child: const Text('Download')),
-      },
+      ],
     );
   }
 }
@@ -161,6 +164,7 @@ class _YourWordsCard extends ConsumerStatefulWidget {
 
 class _YourWordsCardState extends ConsumerState<_YourWordsCard> {
   final _name = TextEditingController();
+  final _aliases = TextEditingController();
   final _vocabulary = TextEditingController();
   final _leaveOut = TextEditingController();
   YourWords? _saved;
@@ -168,6 +172,7 @@ class _YourWordsCardState extends ConsumerState<_YourWordsCard> {
   @override
   void dispose() {
     _name.dispose();
+    _aliases.dispose();
     _vocabulary.dispose();
     _leaveOut.dispose();
     super.dispose();
@@ -178,6 +183,7 @@ class _YourWordsCardState extends ConsumerState<_YourWordsCard> {
     if (saved == null) return;
     final now = YourWords(
       name: _name.text.trim(),
+      aliases: _aliases.text.trim(),
       vocabulary: _vocabulary.text.trim(),
       leaveOut: _leaveOut.text.trim(),
     );
@@ -187,6 +193,7 @@ class _YourWordsCardState extends ConsumerState<_YourWordsCard> {
         .read(yourWordsProvider.notifier)
         .set(
           name: now.name == saved.name ? null : now.name,
+          aliases: now.aliases == saved.aliases ? null : now.aliases,
           vocabulary: now.vocabulary == saved.vocabulary ? null : now.vocabulary,
           leaveOut: now.leaveOut == saved.leaveOut ? null : now.leaveOut,
         );
@@ -214,6 +221,7 @@ class _YourWordsCardState extends ConsumerState<_YourWordsCard> {
     if (words != null && _saved == null) {
       _saved = words;
       _name.text = words.name;
+      _aliases.text = words.aliases;
       _vocabulary.text = words.vocabulary;
       _leaveOut.text = words.leaveOut;
     }
@@ -223,6 +231,12 @@ class _YourWordsCardState extends ConsumerState<_YourWordsCard> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           _field(const Key('your-name'), _name, 'Your name', 'Nishchay'),
+          _field(
+            const Key('your-aliases'),
+            _aliases,
+            'Other names people call you',
+            'Nicknames or spellings, comma separated.',
+          ),
           _field(
             const Key('your-vocabulary'),
             _vocabulary,

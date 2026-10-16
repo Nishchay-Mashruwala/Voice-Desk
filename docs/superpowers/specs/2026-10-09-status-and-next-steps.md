@@ -1,6 +1,13 @@
 # Status and next steps — handoff
 
-Date: 2026-10-09, updated 2026-10-13 · Read this first when picking the work up again.
+Date: 2026-10-09, updated 2026-10-14 · Read this first when picking the work up again.
+
+**2026-10-14:** the owner asked for nine features (Hindi/Gujarati, speakers,
+nicknames, fix a line, keep N days + FLAC, copy/share, Storage, Accuracy,
+first-start setup). They are designed in
+[2026-10-14-mobile-next-features-design.md](2026-10-14-mobile-next-features-design.md),
+which the owner approved; the order is 2b → 2c → 3. **Plan 2b (better speech)
+is built**; see "Plan 2b" near the end. Nothing is committed: the owner commits.
 
 **Where we are (2026-10-13, afternoon):** desktop split done (part 2
 uncommitted) · project reorganised into `desktop/{frontend,backend}` and
@@ -393,6 +400,239 @@ is in the spec and Plan 2a.)
    ~60, much less on newer phones. Plus tuning: IndicConformer only on pieces
    that aren't clearly English; speaker-detection step size. This shapes
    Plans 2–4 (not written yet).
+
+### Plan 2b — better speech (built 2026-10-14, not committed)
+[Plan](../plans/2026-10-14-mobile-plan-2b-better-speech.md) ·
+[ledger](../plans/2026-10-14-mobile-plan-2b-progress.md). What changed:
+- **English reader:** Parakeet 110M's transducer variant, with per-word
+  confidence and modified beam search; an unsure phrase is re-read with
+  0.3 s before it. "fine" now comes out right.
+- **Hindi/Gujarati:** the ready-made IndicConformer files from Hugging Face,
+  mixed with English by the desktop's method, ported. The port gives the
+  same answers as the desktop on 400 random cases.
+- **Settings → Speech:** Languages (chips) and Accuracy (Auto, Faster, More
+  accurate, with this phone's time estimates).
+- **Models:** a catalogue, each model downloaded and deleted on its own.
+- **Database:** schema 3, each recording keeping its setup.
+
+On the M31 (2026-10-14):
+- the update installed over Plan 2a, with recordings kept and the old model
+  removed;
+- the Gujarati model downloaded. This needed a downloader fix: it now asks
+  for the bytes uncompressed;
+- a 1.5-min English+Gujarati recording took ~1.5 min after Stop, peak memory
+  1.09 GB.
+
+**Final review** (fresh reviewer), with fixes made afterwards (tests first):
+- long phrases had lost their start when audio came 10 s at a time;
+- the audio history was copied on every 32 ms window. On the PC, fixing it
+  roughly halved the processing time: English 0.04–0.06×, English+Gujarati
+  0.10×;
+- recordings that need a model the settings no longer ask for are now
+  offered the download;
+- two Hindi marker words that are everyday Gujarati were removed.
+
+The fixed build has **not** been installed on the M31 yet. Deferred minors
+are listed in the ledger.
+
+**Waiting for the owner (Task 9):** clips with their right words:
+- Gujarati with English;
+- some Hindi;
+- two people taking turns;
+- and corrections of the three draft English references in the scratchpad
+  `testaudio` folder.
+
+Then tune on them (`flutter test tool/measure_test.dart`). Not done on the
+phone: the 482 MB "More accurate" model (measured on the PC only).
+
+### Plan 2c-a — transcript tools and downloads (built 2026-10-14, not committed)
+The owner picked these after 2b: "complete 1-4 first and add 5 [speakers]
+in future plans".
+[Plan](../plans/2026-10-14-mobile-plan-2c-transcript-tools.md) ·
+[ledger](../plans/2026-10-14-mobile-plan-2c-progress.md).
+- **Other names people call you:** fixed in transcripts like the name.
+- **Fix the words:** long-press a transcript line. Unchanged words keep
+  their times (port of the desktop's `retime_words`).
+- **Process again** (↻ on a recording): choose the accuracy and languages
+  for the run. The new lines are drafts until the run completes, so the old
+  text stays until then (schema 4).
+- **Settings → Storage:** every model with a green "Downloaded" tag,
+  Download / Delete, sizes and free space. The Accuracy rows have the same
+  green tag.
+
+Checked on the M31 (installed when the app was idle; dialogs opened and
+cancelled, so the owner's recordings were not changed).
+
+**Next:** speakers (Part C), then 2c-b. Task 9 of 2b still waits for the
+owner's clips.
+
+### 2026-10-15 — fixes, smaller app, phone measurements (not committed)
+The owner's list for 2026-10-15: 1 speakers, 2 summary + tasks, 3 everyday
+tools, 4 phone measurements, 5–9 fixes, 10 smaller app. Items 4–10 are done:
+see [../plans/2026-10-15-mobile-fixes-and-measurements.md](../plans/2026-10-15-mobile-fixes-and-measurements.md).
+- **Release app:** 47.8 MB.
+- **M31, English + Gujarati:** Faster ~0.55× real time, peak 0.8 GB; More
+  accurate ~1×, peak 1.4 GB.
+- **Two bugs found and fixed:**
+  - the models' memory stayed with the app after each job;
+  - a black screen when opening the app after an update or reboot.
+
+**Next:** speakers (Plan 3, built below), then summary + tasks (Plan 4),
+then everyday tools (Plan 2c-b). The owner wants the Wi-Fi connection to the
+phone, not the cable.
+
+### Plan 3 — speakers (built 2026-10-15, not committed)
+Item 1 of the owner's 2026-10-15 list.
+[Plan](../plans/2026-10-15-mobile-plan-3-speakers.md) ·
+[ledger](../plans/2026-10-15-mobile-plan-3-progress.md).
+- **Who said what:** while turning speech into text, the engine makes a
+  CAM++ voice print of each phrase. Phrases over 3 s get one print per
+  1.5 s window. After the text, the lines are grouped by voice and cut where
+  the speaker changes. Names: "Me" (your trained voice), remembered people,
+  then "Person 1, 2…". Settings → Speech → "Speaker detection" (on by
+  default; 28 MB model).
+- **Me:** Settings → People → Your voice. Read a short passage (8–25 s);
+  Re-train and Forget my voice.
+- **On a recording:** the name shows above each change of speaker. Tap it to
+  rename them, ticking "Recognise this voice in future recordings" to
+  remember the voice. Long-press a line → "Said by…" moves only that line.
+- **Settings → People:** your voice, then the remembered names with Rename
+  and Forget. Past recordings keep their names.
+
+Checked on the PC with the real models:
+- the David/Zira conversation: 98.8% of the speech time to the right person
+  (the one miss is a 0.36 s "Fine.", too short for a print);
+- trained on rec2's reading, all of rec16's lines are "Me", and no line of the
+  conversation is.
+
+Reviewed afterwards: 3 important and 5 minor problems, all fixed. The worst:
+the microphone stayed on when the training screen was closed mid-reading.
+Added: Try again for a failed speakers step.
+
+**Checked on the M31 (2026-10-16):**
+- The David/Zira conversation, played from the phone's own speaker: every
+  line went to the right voice except one word at a change of speaker.
+- Renamed David and Zira with "Recognise this voice"; a second recording of
+  it was named David and Zira by itself, every line right.
+- Process again on a stage clip: Person 1/2/3, in 78 s.
+- Training "Me" needs the owner's voice (checked on the PC).
+- Seen on the way: with Hindi ticked, short English words ("Great", "Okay",
+  "Right", "agreed") came out in Devanagari. This is speech mixing (Plan 2b),
+  not speakers.
+
+### Plan 2c-b — everyday tools (built 2026-10-15, not committed)
+Item 3 of the owner's 2026-10-15 list.
+[Plan](../plans/2026-10-15-mobile-plan-2c-b-everyday-tools.md) ·
+[ledger](../plans/2026-10-15-mobile-plan-2c-b-progress.md).
+- **FLAC:** a pure-Dart encoder and decoder (fixed predictors, Rice coding,
+  a seek point every 10 s).
+  - Finished recordings are compressed when no speech job can run. The FLAC
+    is decoded back and compared before the pieces go.
+  - rec17 comes out at 45% of the WAV. libsndfile reads it and seeks in it
+    sample for sample.
+  - 30 min takes 6.8 s to encode on the PC.
+- **Keep recordings for:** Forever / 7 / 30 / 90 days / 1 year, default 30.
+  Only done recordings lose their audio, and their text stays. They show
+  "Text only" and can't be played or processed again.
+- **Storage:** what is on the phone, the recordings by size with Delete
+  (Undo), and the models.
+- **Copy / share:** the transcript as text, from the recording's Share
+  button; "Copy this line" on a line.
+- **First start:** welcome, permissions, about you, your voice, downloads.
+  Shows once; filled in on a phone already in use.
+- **Licences & credits:** Settings → About; the model licences are added to
+  Flutter's licence page.
+
+**Checked on the M31 (2026-10-16):**
+- The setup showed once, filled in.
+- The owner's recordings were compressed at start (1:32 → 1.7 MB).
+- Play, seek and tap-a-word work on the FLAC, and Process again reads it.
+- The share sheet opens with the text.
+- Licences & credits opens.
+
+**Bug found on the phone, fixed:** the release app had no INTERNET permission
+(Flutter puts it only in the debug and profile manifests). Since the first
+release build (2026-10-15) no model could be downloaded: "Failed host lookup".
+- Now in the main manifest, with a test.
+- The downloader logs the real reason a download fails.
+
+### Task AI sizes compared on the PC (2026-10-15, for Plan 4)
+Qwen3 0.6B, 1.7B and 4B on 12 cases (3 runs each). The cases:
+- the desktop's three task tests;
+- two real desktop meetings with no tasks for the owner;
+- the David/Zira conversation;
+- Hinglish and Gujarati meetings;
+- other people's tasks only;
+- a long meeting in two parts;
+- to-dos in Hinglish;
+- a nickname.
+
+The results, with the desktop's prompt, then without its example sentences
+("v2"), with and without a check on each task's quote:
+- The small models copy the prompt's example ("Send the Q3 deck to Priya …
+  by Friday") into meetings where nobody said it. The v2 prompt stops that.
+- **0.6B is poor** whatever the prompt: v2 finds 40/57 tasks, and only 11 of
+  36 runs are fully right even with the quote check.
+- **1.7B with v2 and the quote check:** finds 57/57 tasks, 5 of other
+  people's tasks get in, and 25 of 36 runs are fully right.
+- **4B with v2 and the quote check:** 57/57 found, 2 of other people's tasks
+  get in, nothing invented, and 34 of 36 runs are fully right.
+
+Design for Plan 4, waiting for the owner's answers:
+[2026-10-15-mobile-tasks-design.md](2026-10-15-mobile-tasks-design.md).
+
+Scripts and results: the session scratchpad's `taskai/`.
+
+### Plan 4 — summary and tasks (built 2026-10-16, not committed)
+Item 2 of the owner's 2026-10-15 list.
+[Design](2026-10-15-mobile-tasks-design.md) ·
+[plan](../plans/2026-10-16-mobile-plan-4-tasks.md) ·
+[ledger](../plans/2026-10-16-mobile-plan-4-progress.md).
+- **The engine:** llama.cpp b11320 (the desktop's build) compiled into the app
+  with the NDK, behind `mobile/native/llm/vd_llm` (load, count tokens,
+  generate with a grammar, stop, close), called through Dart FFI in an
+  isolate. The same library builds for Windows (`build_windows.ps1`) so the
+  PC tests run the real model. The app grew 48.6 → 54.5 MB (arm64,
+  `--split-per-abi`).
+- **The models:** Qwen3 1.7B (1.1 GB) on every phone; 4B "More accurate"
+  (2.5 GB) in Settings → Processing → Task AI on phones with 8 GB. "Find
+  tasks" (on by default) downloads the model with the speech models.
+- **The step:** after the text and speakers, a summary and the owner's tasks:
+  the v2 prompts, parts of ~3,000 tokens, a merge, the quote check, to-do
+  mode for one voice or only "Me". Saved part by part; gives way to a
+  recording and to speech; waits for charging and cooling like speech;
+  continues after a kill. Process again and Find tasks keep what the owner
+  changed and don't bring back what he deleted.
+- **Screens:** Summary and Your tasks on the recording (Find tasks, Try again,
+  the train-your-voice hint); the Tasks tab (tick, edit, due, copy, delete
+  with Undo, drag to reorder, Where it was said, Add a task…).
+
+**Checked on the M31 (2026-10-16):**
+- Spike (adb shell): 1.7B, a 608-token meeting with the grammar: 173 s,
+  peak 1.69 GB (1.1 GB of it the model file); the same answer as the PC.
+- In the app: the banner downloaded the task model; the owner's 11 s
+  recording got its summary and both tasks ("Complete making the app",
+  "Add two pages to the app", due tomorrow) by itself.
+- Tasks tab: add, tick, Show completed, Delete with Undo (Undo restores it;
+  without it the task goes).
+
+**Not done (the owner, 2026-10-16: "if this is taking too much time then
+leave it"):** the PC quality gate with the real model
+(`test/engine/tasks/task_quality_test.dart`, cases in
+`C:\src\vdllm\task_cases.json`) was stopped after an hour on the CPU, with
+no result; the 4B run wasn't started. Also not measured: a 30-min
+recording's tasks step on the phone (time, memory, screen off).
+
+### Release signing (2026-10-16)
+- Release builds are signed with the app's own key, not Flutter's debug key:
+  `C:\Users\Rajvee\.voicedesk-keys\voicedesk-release.jks` (alias `voicedesk`;
+  passwords in `mobile/frontend/android/key.properties`, git-ignored, and a
+  copy next to the keystore). Certificate SHA-256
+  `5c8b7b8a1666d584c66a0259391fcf5d4b6399401aaffc246f4046d86b1015da`.
+- Without `key.properties` a release build falls back to the debug key.
+- Every future update must be signed with this key: back it up off this PC.
+- Build to share: `flutter build apk --release --split-per-abi`, then
+  `app-arm64-v8a-release.apk`.
 
 ### Mobile plans still to write and build
 2 Models + speech to text (incl. first-start flow, queue, processing service,

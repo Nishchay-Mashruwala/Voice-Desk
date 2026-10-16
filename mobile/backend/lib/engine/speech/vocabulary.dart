@@ -44,25 +44,42 @@ class CommonWords {
 ///   (at most 40% of the letters different);
 /// - entries under 4 letters only match exactly.
 class Vocabulary {
-  Vocabulary(List<String> entries, this._common)
+  Vocabulary(List<String> entries, this._common, {this.fixBelow = 0.6})
       : _entries = [
           for (final e in {for (final e in entries) _letters(e): e.trim()}.entries)
             if (e.key.isNotEmpty) _Entry(e.value, e.key, e.value.split(RegExp(r'\s+')).length),
         ]..sort((a, b) => b.letters.length.compareTo(a.letters.length));
 
-  /// Settings: the name (whole and each part of 3+ letters) and the vocabulary
-  /// (entries separated by commas or new lines).
-  factory Vocabulary.fromSettings({required String name, required String vocabulary, required CommonWords common}) {
-    final parts = name.trim().split(RegExp(r'\s+')).where((p) => _letters(p).length >= 3);
+  /// Settings: the name and the other names people call you (each whole, and
+  /// each part of 3+ letters) and the vocabulary (entries separated by commas
+  /// or new lines).
+  factory Vocabulary.fromSettings({
+    required String name,
+    String aliases = '',
+    required String vocabulary,
+    required CommonWords common,
+    double fixBelow = 0.6,
+  }) {
+    List<String> entries(String text) => text.split(RegExp(r'[,\n]')).map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+    List<String> withParts(String n) {
+      final parts = n.split(RegExp(r'\s+')).where((p) => _letters(p).length >= 3).toList();
+      return [n, if (parts.length > 1) ...parts];
+    }
+
     return Vocabulary([
-      ...vocabulary.split(RegExp(r'[,\n]')).map((e) => e.trim()).where((e) => e.isNotEmpty),
-      if (name.trim().isNotEmpty) name.trim(),
-      if (parts.length > 1) ...parts,
-    ], common);
+      ...entries(vocabulary),
+      if (name.trim().isNotEmpty) ...withParts(name.trim()),
+      for (final alias in entries(aliases)) ...withParts(alias),
+    ], common, fixBelow: fixBelow);
   }
 
   final List<_Entry> _entries;
   final CommonWords _common;
+
+  /// A sound-alike is fixed only where the recognizer was less sure than this
+  /// of every word it replaces (unknown counts as unsure): a word heard
+  /// clearly is left as heard.
+  final double fixBelow;
 
   bool get isEmpty => _entries.isEmpty;
 
@@ -101,7 +118,11 @@ class Vocabulary {
         if (run.take(n - 1).any((w) => RegExp(r'[^\p{L}\p{N}]$', unicode: true).hasMatch(w.text))) continue;
         final heard = run.map((w) => _letters(w.text)).join();
         if (heard == e.letters) return (e, n);
-        if (_soundsLike(heard, e.letters) && !run.any((w) => _common.contains(w.text))) return (e, n);
+        if (_soundsLike(heard, e.letters) &&
+            !run.any((w) => _common.contains(w.text)) &&
+            run.every((w) => w.conf == null || w.conf! < fixBelow)) {
+          return (e, n);
+        }
       }
     }
     return null;

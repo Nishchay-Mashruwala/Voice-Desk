@@ -28,6 +28,29 @@ void main() {
         await req.response.flush();
         return;
       }
+      if (req.uri.path == '/compressing') {
+        // Hugging Face gzips text files for a client that accepts it.
+        final accepts = req.headers.value(HttpHeaders.acceptEncodingHeader) ?? '';
+        if (accepts.contains('gzip')) {
+          final packed = gzip.encode(data);
+          req.response.headers.set(HttpHeaders.contentEncodingHeader, 'gzip');
+          req.response.contentLength = packed.length;
+          req.response.add(packed);
+        } else {
+          req.response.contentLength = data.length;
+          req.response.add(data);
+        }
+        await req.response.close();
+        return;
+      }
+      if (req.uri.path == '/elsewhere') {
+        // Hugging Face's resolve/ answers with a full URL on another host (its CDN).
+        req.response
+          ..statusCode = HttpStatus.found
+          ..headers.set(HttpHeaders.locationHeader, 'http://localhost:${server.port}/file');
+        await req.response.close();
+        return;
+      }
       if (req.uri.path == '/moved') {
         req.response
           ..statusCode = HttpStatus.found
@@ -98,4 +121,18 @@ void main() {
     );
     expect(File('${dest.path}.part').lengthSync(), 102400);
   }, timeout: const Timeout(Duration(seconds: 20)));
+
+  test('a cross-host redirect is followed, and a resumed one keeps its range', () async {
+    final dest = File('${dir.path}/gu.onnx');
+    File('${dest.path}.part').writeAsBytesSync(data.sublist(0, 1000));
+    await Downloader().fetch(url('/elsewhere'), dest, size: data.length, sha256: hash);
+    expect(dest.readAsBytesSync(), data);
+    expect(ranges, ['bytes=1000-', 'bytes=1000-']);
+  });
+
+  test('a server that would compress the file sends it as it is', () async {
+    final dest = File('${dir.path}/tokens.txt');
+    await Downloader().fetch(url('/compressing'), dest, size: data.length, sha256: hash);
+    expect(dest.readAsBytesSync(), data);
+  });
 }

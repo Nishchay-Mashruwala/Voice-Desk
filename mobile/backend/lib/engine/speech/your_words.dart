@@ -8,15 +8,19 @@ import 'leave_out.dart';
 import 'vocabulary.dart';
 
 const kNameKey = 'user_name';
+const kAliasesKey = 'aliases';
 const kVocabularyKey = 'vocabulary';
 const kLeaveOutKey = 'leave_out';
 
 /// Settings → "You and your words", as on the desktop.
 @immutable
 class YourWords {
-  const YourWords({this.name = '', this.vocabulary = '', this.leaveOut = ''});
+  const YourWords({this.name = '', this.aliases = '', this.vocabulary = '', this.leaveOut = ''});
 
   final String name;
+
+  /// Other names people call you: nicknames or spellings, comma separated.
+  final String aliases;
 
   /// Words to get right; entries separated by commas or new lines.
   final String vocabulary;
@@ -24,14 +28,19 @@ class YourWords {
   /// Words never written ("umm, uh, the the").
   final String leaveOut;
 
-  bool get isEmpty => name.trim().isEmpty && vocabulary.trim().isEmpty && leaveOut.trim().isEmpty;
+  bool get isEmpty =>
+      name.trim().isEmpty && aliases.trim().isEmpty && vocabulary.trim().isEmpty && leaveOut.trim().isEmpty;
 
   @override
   bool operator ==(Object other) =>
-      other is YourWords && other.name == name && other.vocabulary == vocabulary && other.leaveOut == leaveOut;
+      other is YourWords &&
+      other.name == name &&
+      other.aliases == aliases &&
+      other.vocabulary == vocabulary &&
+      other.leaveOut == leaveOut;
 
   @override
-  int get hashCode => Object.hash(name, vocabulary, leaveOut);
+  int get hashCode => Object.hash(name, aliases, vocabulary, leaveOut);
 }
 
 final yourWordsProvider = AsyncNotifierProvider<YourWordsNotifier, YourWords>(YourWordsNotifier.new);
@@ -42,20 +51,23 @@ class YourWordsNotifier extends AsyncNotifier<YourWords> {
     final settings = ref.read(settingsRepositoryProvider);
     return YourWords(
       name: await settings.getString(kNameKey),
+      aliases: await settings.getString(kAliasesKey),
       vocabulary: await settings.getString(kVocabularyKey),
       leaveOut: await settings.getString(kLeaveOutKey),
     );
   }
 
   /// Saves what's given; the rest stays.
-  Future<void> set({String? name, String? vocabulary, String? leaveOut}) async {
+  Future<void> set({String? name, String? aliases, String? vocabulary, String? leaveOut}) async {
     final settings = ref.read(settingsRepositoryProvider);
     final now = await future;
     if (name != null) await settings.setString(kNameKey, name);
+    if (aliases != null) await settings.setString(kAliasesKey, aliases);
     if (vocabulary != null) await settings.setString(kVocabularyKey, vocabulary);
     if (leaveOut != null) await settings.setString(kLeaveOutKey, leaveOut);
     state = AsyncData(YourWords(
       name: name ?? now.name,
+      aliases: aliases ?? now.aliases,
       vocabulary: vocabulary ?? now.vocabulary,
       leaveOut: leaveOut ?? now.leaveOut,
     ));
@@ -79,7 +91,8 @@ class TranscriptPolish {
   /// Vocabulary first (so a fixed name can't be left out by accident of
   /// spelling), then Leave out; a line left empty is dropped.
   List<Phrase> apply(List<Phrase> lines) => [
-        for (final line in lines) ?_leaveOut.phrase(_vocabulary.apply(line)),
+        for (final line in lines)
+          if (_leaveOut.phrase(_vocabulary.apply(line)) case final p?) p.withVoices(line.voices),
       ];
 }
 
@@ -90,7 +103,7 @@ final transcriptPolishProvider = FutureProvider<TranscriptPolish>((ref) async {
   if (words.isEmpty) return TranscriptPolish.none;
   final common = await ref.watch(commonWordsProvider.future);
   return TranscriptPolish(
-    Vocabulary.fromSettings(name: words.name, vocabulary: words.vocabulary, common: common),
+    Vocabulary.fromSettings(name: words.name, aliases: words.aliases, vocabulary: words.vocabulary, common: common),
     LeaveOut(words.leaveOut),
   );
 });

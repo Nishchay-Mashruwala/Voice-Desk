@@ -2,6 +2,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:mobile_backend/engine/audio/flac.dart';
 import 'package:mobile_backend/engine/audio/pcm_reader.dart';
 import 'package:mobile_backend/engine/audio/wav.dart';
 
@@ -49,5 +50,49 @@ void main() {
   test('totalMs adds the pieces', () {
     final pieces = [piece(dir, 'piece-000.wav', 16000, 0), piece(dir, 'piece-001.wav', 8000, 0)];
     expect(totalMs(pieces), 1500);
+  });
+
+  group('a FLAC', () {
+    /// Three pieces (1 s, 1.5 s, 0.7 s) and the FLAC of them.
+    Future<(List<File>, File)> both() async {
+      final pieces = [
+        piece(dir, 'piece-000.wav', 16000, 0),
+        piece(dir, 'piece-001.wav', 24000, 16000),
+        piece(dir, 'piece-002.wav', 11200, 40000),
+      ];
+      final flac = File('${dir.path}/audio.flac');
+      Stream<Int16List> samples() async* {
+        for (final p in pieces) {
+          final b = p.readAsBytesSync();
+          yield b.buffer.asInt16List(kWavHeaderBytes, (b.length - kWavHeaderBytes) ~/ 2);
+        }
+      }
+
+      await writeFlac(samples(), flac, totalSamples: 51200);
+      return (pieces, flac);
+    }
+
+    test('reading a FLAC gives the samples the pieces had', () async {
+      final (pieces, flac) = await both();
+      expect(await all(readSamples([flac], fromMs: 0)), await all(readSamples(pieces, fromMs: 0)));
+    });
+
+    test("reading from the middle of a FLAC gives the pieces' samples", () async {
+      final (pieces, flac) = await both();
+      expect(await all(readSamples([flac], fromMs: 1234, toMs: 2900)),
+          await all(readSamples(pieces, fromMs: 1234, toMs: 2900)));
+    });
+
+    test('chunks of a FLAC are as long as those of the pieces', () async {
+      final (_, flac) = await both();
+      final sizes = [await for (final c in readSamples([flac], fromMs: 0, chunkMs: 1000)) c.length];
+      expect(sizes, [16000, 16000, 16000, 3200]);
+    });
+
+    test("a FLAC's length is its samples", () async {
+      final (_, flac) = await both();
+      expect(audioDuration(flac), const Duration(milliseconds: 3200));
+      expect(totalMs([flac]), 3200);
+    });
   });
 }

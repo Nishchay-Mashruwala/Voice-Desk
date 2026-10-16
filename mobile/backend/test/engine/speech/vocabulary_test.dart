@@ -107,4 +107,37 @@ void main() {
     expect(v.apply(heard('Nishher said yes')).text, 'Nishchay said yes');
     expect(v.apply(heard('Pria will send it')).text, 'Priya will send it');
   });
+
+  Phrase heardWith(List<(String, double?)> words) => Phrase(
+        startMs: 0,
+        endMs: words.length * 500,
+        text: words.map((w) => w.$1).join(' '),
+        words: [for (final (i, (w, c)) in words.indexed) Word(w, i * 500, i * 500 + 500, c)],
+      );
+  final vocab = Vocabulary.fromSettings(name: 'Nishchay', vocabulary: 'Priya', common: common);
+
+  test('a confidently heard word is never changed into a sound-alike', () {
+    expect(vocab.apply(heardWith([('Nishher', 0.95), ('said', 0.9)])).text, 'Nishher said');
+  });
+
+  test('an unsure one is', () {
+    expect(vocab.apply(heardWith([('Nishher', 0.3), ('said', 0.9)])).text, 'Nishchay said');
+    // Unknown confidence (an older reader): as before, it is fixed.
+    expect(vocab.apply(heardWith([('Nishher', null)])).text, 'Nishchay');
+  });
+
+  test('an exact match applies at any confidence', () {
+    expect(vocab.apply(heardWith([('nishchay', 0.99)])).text, 'Nishchay');
+  });
+
+  test('Gujarati-script words never match an entry', () {
+    expect(vocab.apply(heardWith([('નિશ્ચય', null), ('પ્રિયા', null)])).text, 'નિશ્ચય પ્રિયા');
+  });
+
+  test('an other name is fixed like the name', () {
+    final v = Vocabulary.fromSettings(name: 'Nishchay', aliases: 'Nishu, Nish Bhai', vocabulary: '', common: common);
+    expect(v.apply(heardWith([('Nishoo', 0.3), ('said', 0.9)])).text, 'Nishu said');
+    expect(v.apply(heardWith([('Nishoo', 0.95)])).text, 'Nishoo'); // heard clearly: left as heard
+    expect(v.apply(heardWith([('nish', 0.9), ('bhai', 0.9)])).text, 'Nish Bhai');
+  });
 }

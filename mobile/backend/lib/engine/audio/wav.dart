@@ -1,6 +1,8 @@
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'flac.dart';
+
 /// The models' input format: 16 kHz, mono, 16-bit PCM.
 const kSampleRate = 16000;
 const kBytesPerSecond = kSampleRate * 2;
@@ -49,6 +51,9 @@ Future<void> finalizeWav(File f) async {
     await raf.close();
   }
 }
+
+/// How long a recording's audio file plays: a WAV piece or its FLAC.
+Duration audioDuration(File f) => f.path.endsWith('.flac') ? flacDuration(f) : wavDuration(f);
 
 /// How long a 16 kHz mono 16-bit WAV file plays.
 Duration wavDuration(File f) {

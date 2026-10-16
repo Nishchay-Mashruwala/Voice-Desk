@@ -55,6 +55,23 @@ void main() {
     expect(find.text('Turning “Weekly review” into text · 0%'), findsOneWidget);
   });
 
+  testWidgets('after the text, finding who said what is said', (t) async {
+    await show(t,
+        processing: const ProcessingState(recordingId: 1, title: 'Weekly review', progress: 1, step: 'speakers'));
+    expect(find.text('Finding who said what in “Weekly review”'), findsOneWidget);
+  });
+
+  testWidgets('finding tasks names the recording and the part', (t) async {
+    await show(t,
+        processing: const ProcessingState(recordingId: 1, title: 'Weekly review', progress: 1, step: 'tasks', part: 2, parts: 3));
+    expect(find.text('Finding tasks in “Weekly review” · part 2 of 3'), findsOneWidget);
+  });
+
+  testWidgets('a recording read in one part has no part number', (t) async {
+    await show(t, processing: const ProcessingState(recordingId: 1, title: 'Weekly review', progress: 1, step: 'tasks', part: 1));
+    expect(find.text('Finding tasks in “Weekly review”'), findsOneWidget);
+  });
+
   testWidgets('waiting for charge is said', (t) async {
     await show(t, processing: const ProcessingState(waiting: 'charge'));
     expect(find.text('Waiting for charging to turn recordings into text'), findsOneWidget);
@@ -76,5 +93,23 @@ void main() {
       ],
     );
     expect(find.widgetWithText(VdBadge, 'Processing 40%'), findsOneWidget);
+  });
+
+  testWidgets('a text-only recording says so on its tile', (t) async {
+    await show(
+      t,
+      list: [
+        Recording(
+          id: 1,
+          title: 'Old review',
+          kind: 'recording',
+          startedAt: DateTime(2026, 8, 13, 9),
+          duration: const Duration(seconds: 100),
+          status: RecordingStatus.done,
+          audioDeleted: true,
+        ),
+      ],
+    );
+    expect(find.widgetWithText(VdBadge, 'Text only'), findsOneWidget);
   });
 }

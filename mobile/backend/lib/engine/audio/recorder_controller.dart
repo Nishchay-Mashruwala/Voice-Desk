@@ -8,6 +8,7 @@ import '../../data/providers.dart';
 import '../../data/recordings_repository.dart';
 import 'audio_source.dart';
 import '../pipeline/processor.dart';
+import '../speech/speech_setup.dart';
 import 'free_space.dart';
 import 'piece_writer.dart';
 import 'recording_notification.dart';
@@ -111,6 +112,15 @@ class RecorderController extends Notifier<RecorderState> {
     }
   }
 
+  /// The speech settings of now; English only if they can't be read.
+  Future<SpeechSetup> _setupNow() async {
+    try {
+      return await ref.read(speechSetupProvider.future);
+    } on Object {
+      return SpeechSetup.englishOnly;
+    }
+  }
+
   Future<void> _start(String? title) async {
     if (!await _source.hasPermission()) {
       state = const RecorderState(message: 'microphone_denied');
@@ -120,7 +130,7 @@ class RecorderController extends Notifier<RecorderState> {
       state = const RecorderState(message: 'storage_low');
       return;
     }
-    final recording = await _repo.create(title: title, startedAt: DateTime.now());
+    final recording = await _repo.create(title: title, startedAt: DateTime.now(), setup: await _setupNow());
     try {
       _title = recording.title;
       final trigger = ref.read(processingTriggerProvider);

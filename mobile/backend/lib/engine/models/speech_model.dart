@@ -1,188 +1,22 @@
 import 'dart:io';
-import 'dart:isolate';
 
-import 'package:archive/archive.dart';
-import 'package:crypto/crypto.dart';
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../data/providers.dart';
+import '../../data/recording.dart';
 import '../audio/recorder_controller.dart' show freeSpaceProvider;
+import 'catalogue.dart';
 import 'downloader.dart';
+import 'model_store.dart';
+import '../speech/speech_setup.dart';
+import '../tasks/task_settings.dart';
 
-/// A file to download, with its exact size and SHA-256.
-class ModelDownload {
-  const ModelDownload(this.url, this.size, this.sha256);
-  final Uri url;
-  final int size;
-  final String sha256;
-}
+enum ModelPhase { missing, downloading, ready, failed }
 
-/// A file kept from a downloaded archive.
-class ModelMember {
-  const ModelMember(this.inArchive, this.fileName, this.size, this.sha256);
-  final String inArchive;
-  final String fileName;
-  final int size;
-  final String sha256;
-}
-
-final kVadDownload = ModelDownload(
-  Uri.parse('https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx'),
-  643854,
-  '9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6',
-);
-
-final kParakeetDownload = ModelDownload(
-  Uri.parse(
-      'https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet_tdt_ctc_110m-en-36000-int8.tar.bz2'),
-  104337827,
-  '17f945007b52ccd8b7200ffc7c5652e9e8e961dfdf479cefcabd06cf5703630b',
-);
-
-const kParakeetMembers = [
-  ModelMember('sherpa-onnx-nemo-parakeet_tdt_ctc_110m-en-36000-int8/model.int8.onnx', 'model.int8.onnx', 131652171,
-      '9177a9146cf32ee0cc8152276ef95116f312018d316be37ccf57f7efea81fc1a'),
-  ModelMember('sherpa-onnx-nemo-parakeet_tdt_ctc_110m-en-36000-int8/tokens.txt', 'tokens.txt', 9953,
-      '450e56bd2f036fe5b6aa821865838cc5aa9d8b0106134ce9a9ba0664abe6cd10'),
-];
-
-/// Free storage needed to start the download (archive + unpacked + margin).
-const kMinFreeForSpeechModel = 300 * 1024 * 1024;
-
-/// The speech model's files on the phone.
-class SpeechModelFiles {
-  const SpeechModelFiles({required this.vad, required this.model, required this.tokens});
-  final File vad;
-  final File model;
-  final File tokens;
-}
-
-/// Silero VAD + Parakeet under `<root>/speech/`.
-class SpeechModelStore {
-  SpeechModelStore(
-    Directory root,
-    this._downloader, {
-    ModelDownload? vad,
-    ModelDownload? archive,
-    List<ModelMember> members = kParakeetMembers,
-  })  : _dir = Directory('${root.path}/speech'),
-        _vad = vad ?? kVadDownload,
-        _archive = archive ?? kParakeetDownload,
-        _members = List.unmodifiable(members);
-
-  final Directory _dir;
-  final Downloader _downloader;
-  final ModelDownload _vad;
-  final ModelDownload _archive;
-  final List<ModelMember> _members;
-
-  File _member(ModelMember m) => File('${_dir.path}/parakeet/${m.fileName}');
-
-  SpeechModelFiles get files => SpeechModelFiles(
-        vad: File('${_dir.path}/silero_vad.onnx'),
-        model: _member(_members[0]),
-        tokens: _member(_members[1]),
-      );
-
-  /// What the download costs, in bytes.
-  int get downloadBytes => _vad.size + _archive.size;
-
-  bool get ready => _sized(files.vad, _vad.size) && _members.every((m) => _sized(_member(m), m.size));
-
-  static bool _sized(File f, int size) => f.existsSync() && f.lengthSync() == size;
-
-  /// Downloads what's missing (resuming), unpacks and checks it.
-  Future<void> download({void Function(int done, int total)? onProgress}) async {
-    final total = downloadBytes;
-    if (!_sized(files.vad, _vad.size)) {
-      await _downloader.fetch(_vad.url, files.vad, size: _vad.size, sha256: _vad.sha256, onBytes: (n) => onProgress?.call(n, total));
-    }
-    onProgress?.call(_vad.size, total);
-    if (!_members.every((m) => _sized(_member(m), m.size))) {
-      final archive = File('${_dir.path}/parakeet.tar.bz2');
-      // Already here (e.g. the app was closed while unpacking): it was checked
-      // when its download finished, so it isn't fetched again.
-      if (!_sized(archive, _archive.size)) {
-        await _downloader.fetch(_archive.url, archive,
-            size: _archive.size, sha256: _archive.sha256, onBytes: (n) => onProgress?.call(_vad.size + n, total));
-      }
-      onProgress?.call(total, total);
-      final wanted = {for (final m in _members) m.inArchive: _member(m).path};
-      try {
-        await _unpackInIsolate(archive.path, wanted);
-      } on DownloadFailed {
-        if (archive.existsSync()) archive.deleteSync(); // damaged: fetched anew next time
-        rethrow;
-      }
-      if (archive.existsSync()) await archive.delete();
-      for (final m in _members) {
-        final f = _member(m);
-        if (!_sized(f, m.size) || (await sha256.bind(f.openRead()).first).toString() != m.sha256) {
-          for (final x in _members) {
-            if (_member(x).existsSync()) _member(x).deleteSync();
-          }
-          throw const DownloadFailed('corrupt');
-        }
-      }
-    }
-    onProgress?.call(total, total);
-  }
-
-  Future<void> delete() async {
-    if (_dir.existsSync()) await _dir.delete(recursive: true);
-  }
-}
-
-/// Unpacking a 100 MB bzip2 in Dart takes a while: off the UI's isolate. (A
-/// top-level function, so the closure sent to the isolate holds only these two.)
-Future<void> _unpackInIsolate(String archivePath, Map<String, String> wanted) =>
-    Isolate.run(() => _unpack(archivePath, wanted));
-
-/// bzip2 → a temporary tar → only the [wanted] entries (archive path → file
-/// path). The archive is deleted once the tar holds it all (less storage at
-/// the peak); the tar is always deleted.
-Future<void> _unpack(String archivePath, Map<String, String> wanted) async {
-  final tarFile = File('$archivePath.tar');
-  try {
-    final input = InputFileStream(archivePath);
-    final tar = OutputFileStream(tarFile.path);
-    var ok = false;
-    try {
-      ok = BZip2Decoder().decodeStream(input, tar);
-    } on FileSystemException {
-      rethrow; // a full disk is not a damaged archive
-    } on Object {
-      ok = false;
-    } finally {
-      await input.close();
-      await tar.close();
-    }
-    if (!ok) throw const DownloadFailed('corrupt');
-    File(archivePath).deleteSync();
-    final tarInput = InputFileStream(tarFile.path);
-    try {
-      final entries = TarDecoder().decodeStream(tarInput);
-      for (final entry in entries.files) {
-        final name = entry.name.startsWith('./') ? entry.name.substring(2) : entry.name;
-        final dest = wanted[name];
-        if (dest == null || !entry.isFile) continue;
-        await File(dest).parent.create(recursive: true);
-        final out = OutputFileStream(dest);
-        entry.writeContent(out);
-        await out.close();
-      }
-    } finally {
-      await tarInput.close();
-    }
-  } finally {
-    if (tarFile.existsSync()) tarFile.deleteSync();
-  }
-}
-
-enum SpeechModelPhase { missing, downloading, ready, failed }
-
-class SpeechModelState {
-  const SpeechModelState(this.phase, {this.done = 0, this.total = 0, this.message});
-  final SpeechModelPhase phase;
+class ModelState {
+  const ModelState(this.phase, {this.done = 0, this.total = 0, this.message});
+  final ModelPhase phase;
   final int done;
   final int total;
 
@@ -193,53 +27,212 @@ class SpeechModelState {
 /// `<app support>/models`; overridden in `openBackend()`.
 final modelsRootProvider = Provider<Directory>((ref) => throw UnimplementedError('modelsRootProvider not overridden'));
 
-final speechModelStoreProvider =
-    Provider<SpeechModelStore>((ref) => SpeechModelStore(ref.watch(modelsRootProvider), Downloader()));
+final modelStoreProvider = Provider<ModelStore>((ref) => ModelStore(ref.watch(modelsRootProvider), Downloader()));
 
-final speechModelProvider = NotifierProvider<SpeechModel, SpeechModelState>(SpeechModel.new);
+final modelsProvider = NotifierProvider<Models, Map<ModelId, ModelState>>(Models.new);
 
-class SpeechModel extends Notifier<SpeechModelState> {
-  SpeechModelStore get _store => ref.read(speechModelStoreProvider);
+/// Each model's state on the phone: download (what it needs first), delete.
+class Models extends Notifier<Map<ModelId, ModelState>> {
+  ModelStore get _store => ref.read(modelStoreProvider);
 
-  /// Whether the files are on the phone now.
-  bool get isReady => _store.ready;
+  /// Downloads under way, so a model two others need is fetched once.
+  final _running = <ModelId, Future<void>>{};
 
   @override
-  SpeechModelState build() => SpeechModelState(ref.read(speechModelStoreProvider).ready ? SpeechModelPhase.ready : SpeechModelPhase.missing);
+  Map<ModelId, ModelState> build() {
+    final store = ref.read(modelStoreProvider);
+    return {
+      for (final id in ModelId.values) id: ModelState(store.ready(id) ? ModelPhase.ready : ModelPhase.missing),
+    };
+  }
 
-  Future<void> download() async {
-    if (state.phase == SpeechModelPhase.downloading || state.phase == SpeechModelPhase.ready) return;
-    final total = _store.downloadBytes;
-    // Set before the first await, so a second tap is ignored.
-    state = SpeechModelState(SpeechModelPhase.downloading, total: total);
-    if (await ref.read(freeSpaceProvider).bytesFree() < kMinFreeForSpeechModel) {
-      state = const SpeechModelState(SpeechModelPhase.failed, message: 'storage_low');
+  /// Whether the model's files are on the phone now.
+  bool isReady(ModelId id) => _store.ready(id);
+
+  /// What the model takes on the phone now.
+  int bytesOnDisk(ModelId id) => _store.has(id) ? _store.bytesOnDisk(id) : 0;
+
+  /// What a download of everything the settings need started with, so its
+  /// progress counts what is done and never goes back (0: none running).
+  int get batchTotal => _batchTotal;
+  int _batchTotal = 0;
+
+  /// Downloads every model needed (see [neededModelIdsProvider]), one after another.
+  Future<void> downloadNeeded() async {
+    await ref.read(speechSetupProvider.future);
+    await ref.read(taskModelProvider.future);
+    final missing = [for (final id in ref.read(neededModelIdsProvider)) if (!isReady(id)) id];
+    _batchTotal = missing.fold(0, (sum, id) => sum + _store.spec(id).download.size);
+    try {
+      for (final id in missing) {
+        if (isReady(id)) continue; // fetched as another one's need
+        await download(id);
+        if (state[id]?.phase == ModelPhase.failed) return;
+      }
+    } finally {
+      _batchTotal = 0;
+      if (ref.mounted) state = {...state}; // the aggregate drops the batch
+    }
+  }
+
+  List<ModelId> _missing(ModelId id) => [
+        for (final need in _store.spec(id).needs)
+          if (!isReady(need)) need,
+        if (!isReady(id)) id,
+      ];
+
+  /// What getting [id] still costs, what it needs included.
+  int bytesToDownload(ModelId id) => _missing(id).fold(0, (sum, m) => sum + _store.spec(m).download.size);
+
+  void _put(ModelId id, ModelState s) {
+    if (ref.mounted) state = {...state, id: s};
+  }
+
+  Future<void> download(ModelId id) async {
+    if (state[id]?.phase == ModelPhase.downloading) return _running[id];
+    // Done means its files are on the phone, whatever was shown before.
+    if (isReady(id)) {
+      if (state[id]?.phase != ModelPhase.ready) _put(id, const ModelState(ModelPhase.ready));
       return;
     }
-    var shownMb = -1;
+    final missing = _missing(id);
+    final total = missing.fold(0, (sum, m) => sum + _store.spec(m).download.size);
+    // Set before the first await, so a second tap is ignored.
+    _put(id, ModelState(ModelPhase.downloading, total: total));
+    final run = _download(id, missing, total);
+    _running[id] = run;
     try {
-      await _store.download(onProgress: (done, total) {
-        // A screen update per megabyte, not per network chunk.
-        // The end always shows: it is when unpacking starts ("Preparing…").
-        final mb = done ~/ (1024 * 1024);
-        if (mb == shownMb && done < total) return;
-        shownMb = mb;
-        state = SpeechModelState(SpeechModelPhase.downloading, done: done, total: total);
-      });
-      state = const SpeechModelState(SpeechModelPhase.ready);
-    } on DownloadFailed catch (e) {
-      state = SpeechModelState(SpeechModelPhase.failed, message: e.reason == 'corrupt' ? 'corrupt' : 'network');
-    } on FileSystemException {
-      // Writing failed: the phone ran out of storage.
-      state = const SpeechModelState(SpeechModelPhase.failed, message: 'storage_low');
-    } on Object {
-      // Never left "downloading": whatever went wrong, it can be tried again.
-      state = const SpeechModelState(SpeechModelPhase.failed, message: 'network');
+      await run;
+    } finally {
+      _running.remove(id);
     }
   }
 
-  Future<void> delete() async {
-    await _store.delete();
-    state = const SpeechModelState(SpeechModelPhase.missing);
+  Future<void> _download(ModelId id, List<ModelId> missing, int total) async {
+    final room = missing.fold(0, (sum, m) => sum + minFreeToDownload(_store.spec(m)));
+    if (await ref.read(freeSpaceProvider).bytesFree() < room) {
+      _put(id, const ModelState(ModelPhase.failed, message: 'storage_low'));
+      return;
+    }
+    var before = 0; // bytes of the models already fetched in this run
+    var shownMb = -1;
+    void progress(int done) {
+      // A screen update per megabyte, not per network chunk. The end always
+      // shows: it is when unpacking starts ("Preparing…").
+      final at = before + done;
+      final mb = at ~/ (1024 * 1024);
+      if (mb == shownMb && at < total) return;
+      shownMb = mb;
+      _put(id, ModelState(ModelPhase.downloading, done: at, total: total));
+    }
+
+    try {
+      for (final m in missing) {
+        if (m == id) {
+          await _store.download(m, onProgress: (done, _) => progress(done));
+        } else {
+          // Another download may be fetching it already: wait for that one.
+          await (_running[m] ??= _store.download(m, onProgress: (done, _) => progress(done)).whenComplete(() {
+            _running.remove(m); // (a `=>` here would return this very future, and wait for itself)
+          }));
+          // The run waited on may have been the part's own download, which
+          // reports a failure in its state rather than by throwing.
+          if (!isReady(m)) throw const DownloadFailed('network');
+          _put(m, const ModelState(ModelPhase.ready));
+        }
+        before += _store.spec(m).download.size;
+      }
+      _put(id, const ModelState(ModelPhase.ready));
+    } on DownloadFailed catch (e) {
+      _put(id, ModelState(ModelPhase.failed, message: e.reason == 'corrupt' ? 'corrupt' : 'network'));
+    } on FileSystemException {
+      // Writing failed: the phone ran out of storage.
+      _put(id, const ModelState(ModelPhase.failed, message: 'storage_low'));
+    } on Object catch (e) {
+      // Never left "downloading": whatever went wrong, it can be tried again.
+      debugPrint('Voice Desk: ${id.name} could not be downloaded: $e');
+      _put(id, const ModelState(ModelPhase.failed, message: 'network'));
+    }
+  }
+
+  /// Deletes the model, and what it needed if nothing else on the phone does.
+  Future<void> delete(ModelId id) async {
+    await _store.delete(id);
+    _put(id, const ModelState(ModelPhase.missing));
+    for (final need in _store.spec(id).needs) {
+      final stillUsed = ModelId.values
+          .any((other) => other != id && _store.has(other) && _store.spec(other).needs.contains(need) && isReady(other));
+      if (!stillUsed) {
+        await _store.delete(need);
+        _put(need, const ModelState(ModelPhase.missing));
+      }
+    }
   }
 }
+
+/// All the models the speech settings need, as one: for the Record screen's
+/// banner (and the download step of the first start).
+class SpeechModelsState {
+  const SpeechModelsState(this.phase,
+      {this.done = 0, this.total = 0, this.bytesToDownload = 0, this.freeNeeded = 0, this.message, this.missing = Missing.speech});
+  final ModelPhase phase;
+  final int done;
+  final int total;
+
+  /// What is still missing.
+  final int bytesToDownload;
+
+  /// Free storage the missing models need to download and unpack.
+  final int freeNeeded;
+  final String? message;
+
+  /// Which kinds of model are missing (for the banner's words).
+  final Missing missing;
+}
+
+/// Speech models only, the task model only, or both.
+enum Missing { speech, tasks, both }
+
+/// The models needed: those of the speech settings now, and those of every
+/// recording still to be turned into text (made with other settings, e.g. a
+/// language turned off since), so none waits without a way to get them; and
+/// the task model while Find tasks is on (last: speech comes first).
+final neededModelIdsProvider = Provider<List<ModelId>>((ref) {
+  final setup = ref.watch(speechSetupProvider).value ?? SpeechSetup.englishOnly;
+  final task = ref.watch(taskModelProvider).value;
+  const waiting = {RecordingStatus.recording, RecordingStatus.queued, RecordingStatus.processing, RecordingStatus.waitingCharge};
+  final ids = {
+    ...setup.models,
+    for (final r in ref.watch(recordingsProvider).value ?? const <Recording>[])
+      if (waiting.contains(r.status)) ...r.setup.models,
+    ?task,
+  };
+  return [for (final id in ModelId.values) if (ids.contains(id)) id]; // download order
+});
+
+final neededModelsProvider = Provider<SpeechModelsState>((ref) {
+  final states = ref.watch(modelsProvider);
+  final models = ref.read(modelsProvider.notifier);
+  final store = ref.read(modelStoreProvider);
+  final ids = [for (final id in ref.watch(neededModelIdsProvider)) if (store.has(id)) id];
+  final missing = [for (final id in ids) if (!models.isReady(id)) id];
+  final left = missing.fold(0, (sum, id) => sum + store.spec(id).download.size);
+  bool isTask(ModelId id) => id == ModelId.taskFaster || id == ModelId.taskAccurate;
+  final kinds = missing.every(isTask) ? Missing.tasks : (missing.any(isTask) ? Missing.both : Missing.speech);
+  final room = missing.fold(0, (sum, id) => sum + minFreeToDownload(store.spec(id)));
+  if (missing.isEmpty) return const SpeechModelsState(ModelPhase.ready);
+  final running = [for (final id in missing) if (states[id]?.phase == ModelPhase.downloading) id];
+  final failed = [for (final id in missing) if (states[id]?.phase == ModelPhase.failed) id];
+  if (running.isNotEmpty) {
+    final inFlight = running.fold(0, (sum, id) => sum + (states[id]?.done ?? 0));
+    final total = models.batchTotal > left ? models.batchTotal : left;
+    final done = (total - left + inFlight).clamp(0, total);
+    return SpeechModelsState(ModelPhase.downloading,
+        done: done, total: total, bytesToDownload: left, freeNeeded: room, missing: kinds);
+  }
+  if (failed.isNotEmpty) {
+    return SpeechModelsState(ModelPhase.failed,
+        bytesToDownload: left, freeNeeded: room, message: states[failed.first]?.message, missing: kinds);
+  }
+  return SpeechModelsState(ModelPhase.missing, bytesToDownload: left, freeNeeded: room, missing: kinds);
+});

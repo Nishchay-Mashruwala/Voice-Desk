@@ -1,3 +1,5 @@
+import 'dart:math';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mobile_backend/data/transcript.dart';
 import 'package:mobile_backend/engine/speech/words.dart';
@@ -26,5 +28,22 @@ void main() {
     expect(p.text, '');
     expect(p.words, isEmpty);
     expect((p.startMs, p.endMs), (300, 800));
+  });
+
+  test("a word's confidence is its weakest token's", () {
+    final p = phraseFromTokens(['▁N', 'est', 'e', '.'], [0.0, 0.1, 0.2, 0.3],
+        startMs: 0, endMs: 500, logProbs: [log(0.92), log(0.43), log(0.16), log(0.67)]);
+    expect(p.words.single.text, 'Neste.');
+    expect(p.words.single.conf, closeTo(0.16, 1e-9));
+  });
+
+  test("punctuation tokens don't lower a word's confidence", () {
+    final p = phraseFromTokens(['▁it', '.'], [0.0, 0.2], startMs: 0, endMs: 400, logProbs: [log(0.93), log(0.49)]);
+    expect(p.words.single.conf, closeTo(0.93, 1e-9));
+  });
+
+  test('no log probs gives no confidence', () {
+    expect(phraseFromTokens(['▁hi'], [0.0], startMs: 0, endMs: 300).words.single.conf, isNull);
+    expect(phraseFromTokens(['▁hi'], [0.0], startMs: 0, endMs: 300, logProbs: []).words.single.conf, isNull);
   });
 }

@@ -52,7 +52,7 @@ class JustAudioPlayer implements Player {
     final starts = <Duration>[];
     for (final p in pieces) {
       starts.add(at);
-      at += wavDuration(p);
+      at += audioDuration(p);
     }
     _starts = starts;
     await _player.setAudioSources([for (final p in pieces) ja.AudioSource.file(p.path)]);

@@ -1,4 +1,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Model downloads (lib/engine/models). Flutter's template has it only in
+         the debug and profile manifests: without it a release build can't reach the network. -->
+    <uses-permission android:name="android.permission.INTERNET" />
     <!-- Recording (lib/engine/audio): microphone, kept alive by a foreground service. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />

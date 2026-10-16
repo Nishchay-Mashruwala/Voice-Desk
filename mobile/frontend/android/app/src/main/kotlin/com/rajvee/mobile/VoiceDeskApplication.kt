@@ -1,5 +1,6 @@
 package com.rajvee.mobile
 
+import android.app.ActivityManager
 import android.app.Application
 import android.content.Context
 import android.os.Build
@@ -32,12 +33,19 @@ class VoiceDeskApplication : Application() {
             }
         }
         // How hot the phone is (lib/engine/pipeline/conditions.dart): processing slows down or waits.
+        // Also its memory (Auto's choice of speech model).
         MethodChannel(engine.dartExecutor.binaryMessenger, "voicedesk/device").setMethodCallHandler { call, result ->
             when (call.method) {
                 "thermalStatus" -> result.success(
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
                         (getSystemService(Context.POWER_SERVICE) as PowerManager).currentThermalStatus
                     else 0
+                )
+                // Memory, for the speech model Auto picks (lib/engine/speech/speech_setup.dart).
+                "totalRam" -> result.success(
+                    ActivityManager.MemoryInfo().also {
+                        (getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager).getMemoryInfo(it)
+                    }.totalMem
                 )
                 else -> result.notImplemented()
             }

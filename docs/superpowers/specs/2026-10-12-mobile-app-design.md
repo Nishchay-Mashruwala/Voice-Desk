@@ -140,14 +140,18 @@ background work otherwise; the app opens that settings page).
 
 ### Steps
 1. **Cut at pauses**: Silero voice activity (as the desktop).
-2. **Speech to text**: Parakeet on every piece; if Hindi or Gujarati is chosen,
-   IndicConformer on every piece too; per piece and word, the right text is
-   kept, by the desktop's method (`mixed.py`: timings, sounds, English word
-   list). English-only settings skip IndicConformer. Adaptation needed: the
-   desktop's method reads Whisper's word probabilities and language guess;
-   on the phone Parakeet is the English reader, so its CTC token scores take
-   that role (to be checked against the desktop's results). Translation to
-   English is not in version 1 (Hindi/Gujarati are written as spoken).
+2. **Speech to text** (Plan 2b, see
+   [2026-10-14-mobile-next-features-design.md](2026-10-14-mobile-next-features-design.md)
+   Part A). The models:
+   - English: Parakeet 110M, transducer variant, with per-word confidence;
+   - with Hindi or Gujarati ticked, the ready-made IndicConformer per-language
+     int8 models (sherpa-onnx CTC) on every phrase too.
+
+   Per phrase and word, the right text is kept by the desktop's method,
+   ported (`mixed.py`: timings, sounds, English word list). Parakeet's
+   confidences take the role of Whisper's word probabilities. English-only
+   settings skip IndicConformer. Translation to English is not in version 1
+   (Hindi/Gujarati are written as spoken).
 3. **Who spoke when**: pyannote segmentation + CAM++ voices, clustered;
    the owner's lines are "Me" (voice profile, CAM++ embedding); names given to
    people are remembered across meetings.
@@ -176,8 +180,10 @@ made from then on (owner's choice: existing ones stay as they are).
 ### Accuracy goal (owner, 2026-10-13)
 Ordinary words must come out right: "fine" heard as "by" (owner's recording,
 a 0.8 s phrase) is not acceptable in future versions. Leads, in order:
-1. Pad each speech segment (e.g. 0.2–0.3 s before and after) before
-   recognition — a late VAD start can clip a soft first sound ("f-").
+1. Pad each speech segment before recognition: a late VAD start can clip
+   a soft first sound ("f-"). **Done in Plan 2b**: an unsure phrase is
+   re-read with 0.3 s before it and the surer reading is kept. "fine" now
+   comes out right.
 2. Measure on the owner's own recordings (a small test set with the right
    words), before and after each change.
 3. On phones fast enough, a bigger model (Parakeet 0.6B), or a transducer
@@ -245,29 +251,82 @@ Each plan ends with a working app, tested on the M31:
 2a. **English speech to text**: model download (first start), voice activity
    + Parakeet, the processing queue and its notification, processing while
    recording, transcript lines on the recording's screen.
-2b. **Hindi/Gujarati**: IndicConformer int8 on onnxruntime (its decoding
-   ported from `indic.py`), combined per word with Parakeet (`mixed.py`).
-   Needs the owner to publish the int8 model once (see Model downloads).
-3. Speakers. 4. Summary, tasks and the Tasks tab. 5. Calls.
+2b. **Better speech** (built 2026-10-14):
+   - English on Parakeet's transducer variant (re-read when unsure);
+   - Hindi/Gujarati, ready-made IndicConformer files, mixed with English as
+     on the desktop;
+   - Settings → Speech: Languages and Accuracy;
+   - a model catalogue (each model downloaded and deleted on its own).
+
+   Plan: [../plans/2026-10-14-mobile-plan-2b-better-speech.md](../plans/2026-10-14-mobile-plan-2b-better-speech.md).
+2c-a. **Transcript tools and downloads** (built 2026-10-14; the owner's choice
+   of what comes first):
+   - fix a line's words;
+   - other names people call you;
+   - Process again;
+   - Settings → Storage with every model and green "Downloaded" tags.
+
+   Plan: [../plans/2026-10-14-mobile-plan-2c-transcript-tools.md](../plans/2026-10-14-mobile-plan-2c-transcript-tools.md).
+2c-b. **Everyday tools** (built 2026-10-15; the rest of Part B of the
+   2026-10-14 design):
+   - copy or share a transcript;
+   - finished recordings kept as checked FLAC (pure Dart, about 45% of the WAV);
+   - keep recordings' audio for N days (the text stays);
+   - the recordings part of Storage;
+   - the first-start setup;
+   - Licences & credits.
+
+   Plan: [../plans/2026-10-15-mobile-plan-2c-b-everyday-tools.md](../plans/2026-10-15-mobile-plan-2c-b-everyday-tools.md).
+3. **Speakers** (built 2026-10-15; 2026-10-14 design, Part C):
+   - who said each line (CAM++ voice prints per phrase, grouped after the
+     text; lines cut where the speaker changes);
+   - "Me" from a short voice reading (Settings → People → Your voice);
+   - rename a speaker and remember their voice; "Said by…" moves one line;
+   - Settings → People lists the remembered voices.
+
+   Plan: [../plans/2026-10-15-mobile-plan-3-speakers.md](../plans/2026-10-15-mobile-plan-3-speakers.md).
+4. **Summary and tasks** (built 2026-10-16; design:
+   [2026-10-15-mobile-tasks-design.md](2026-10-15-mobile-tasks-design.md)):
+   - llama.cpp b11320 in the app through a small C library (`mobile/native/llm`)
+     and Dart FFI; Qwen3 1.7B on every phone, 4B "More accurate" on 8 GB phones;
+   - after the text and speakers, a summary and the owner's tasks, part by
+     part, giving way to speech; Find tasks on any finished recording;
+   - the recording's Summary / Your tasks, and the Tasks tab ("My tasks").
+
+   Plan: [../plans/2026-10-16-mobile-plan-4-tasks.md](../plans/2026-10-16-mobile-plan-4-tasks.md).
+5. Calls.
 
 ### Data (SQLite)
 - `meetings`: title, kind (recording | call), contact, started_at, duration,
   status (recording | queued | processing | waiting_charge | done | error),
-  current step, error, summary, audio path.
-- `transcript_lines`: meeting, index, start, end, speaker, text, words (timings).
+  current step, error, summary, audio path; how it is turned into text
+  (languages, Hindi or Gujarati preferred, English model), fixed when it is
+  made (schema 3).
+- `transcript_lines`: meeting, start, end, text, words (timings), voice
+  prints, speaker and speaker group (schema 5).
+- `meeting_speakers`: a recording's speaker groups (label, voice print,
+  speech time).
+- `tasks`: the owner's tasks: recording (none when added by hand), words,
+  assigned by, due, quote and where it starts, done, place, found by the AI,
+  touched by the owner, deleted (hidden), created at; `meetings.tasks_status`,
+  `tasks_part`, `tasks_work` (schema 7).
+- `people`: remembered names and voice prints (one per name, any case). Your
+  own voice print: a setting.
 - `tasks`: meeting, description, assigned_by, due, quote, done, position.
-- `people`: name, voice embedding. Voice profile: a file.
 - `jobs`: the processing queue (meeting, next step, attempts).
 - `settings`.
-- Audio: 1-minute pieces while recording, then one FLAC; optional deletion
-  after N days (text kept).
+- Audio: 1-minute pieces while recording, then one checked `audio.flac`
+  (schema 6: `audioDeleted`, `flacFailures`); its audio deleted after N days
+  (`keep_audio_days`, default 30), the text kept.
 
 ### Model downloads
 - sherpa-onnx models: sherpa-onnx's GitHub releases.
 - Qwen GGUF: Hugging Face (unsloth), pinned files with SHA-256, as the desktop.
-- **IndicConformer int8**: a prepared copy published once by the owner (e.g.
-  a GitHub release of the project) with its MIT licence notice; phones can't
-  make the int8 copy themselves (it needs the 2.4 GB float model in memory).
+- **IndicConformer int8** (changed 2026-10-14): ready-made per-language files
+  from Hugging Face (`parismitaglobalsolutions/indicconformer-sherpa-onnx`,
+  pinned to a commit, SHA-256 checked; Apache-2.0 export of AI4Bharat's MIT
+  models). Nothing needs to be published by the owner. Downloads ask for the
+  bytes uncompressed (Hugging Face gzips text files otherwise).
 - The downloader resumes, checks SHA-256, and tries the other addresses of a
   host when one doesn't answer (this network can't reach one of GitHub's
   download addresses).

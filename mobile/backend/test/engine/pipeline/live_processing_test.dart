@@ -14,6 +14,7 @@ import 'package:mobile_backend/engine/models/speech_model.dart';
 import 'package:mobile_backend/engine/pipeline/conditions.dart';
 import 'package:mobile_backend/engine/pipeline/processing_notice.dart';
 import 'package:mobile_backend/engine/pipeline/processor.dart';
+import 'package:mobile_backend/engine/speech/speech_setup.dart';
 import 'package:mobile_backend/engine/speech/speech_to_text.dart';
 
 import 'processor_test.dart' show FakeSpeech, Script, FakeDevice, FakeNotice, TestStore, until;
@@ -27,6 +28,7 @@ void main() {
   late FakeDevice device;
   late Script script;
   late List<FakeSpeech> made;
+  final setups = <SpeechSetup>[];
   late FakeNotice notice;
 
   setUp(() {
@@ -40,10 +42,11 @@ void main() {
       recordingsRootProvider.overrideWithValue(Directory.systemTemp.createTempSync('live')),
       deviceStateProvider.overrideWithValue(device),
       processingNoticeProvider.overrideWithValue(notice),
-      speechModelStoreProvider.overrideWithValue(TestStore()),
-      speechToTextFactoryProvider.overrideWithValue(({required int startMs, required int threads}) async {
+      modelStoreProvider.overrideWithValue(TestStore()),
+      speechToTextFactoryProvider.overrideWithValue(({required SpeechSetup setup, required int startMs, required int threads}) async {
         final s = FakeSpeech(startMs, threads, script);
         made.add(s);
+        setups.add(setup);
         return s;
       }),
     ]);
@@ -66,8 +69,8 @@ void main() {
   }
 
   /// A recording still going, with [pieces] 20-second pieces on disk.
-  Future<int> live(int pieces) async {
-    final r = await repo.create(title: 'Standup', startedAt: DateTime(2026, 10, 13, 9));
+  Future<int> live(int pieces, {SpeechSetup setup = SpeechSetup.englishOnly}) async {
+    final r = await repo.create(title: 'Standup', startedAt: DateTime(2026, 10, 13, 9), setup: setup);
     await addPieces(r.id, 0, pieces);
     return r.id;
   }
@@ -138,5 +141,14 @@ void main() {
     await Future<void>.delayed(Duration.zero);
     expect(notice.calls, contains('show:Standup'));
     gate.complete();
+  });
+
+  test("live processing uses the recording's setup", () async {
+    setups.clear();
+    const setup = SpeechSetup(languages: {Lang.en, Lang.gu}, english: EnglishModel.accurate);
+    final id = await live(2, setup: setup);
+    processor().pieceFinished(id, 1);
+    await until(() async => await transcripts.processedMs(id) >= 20000);
+    expect(setups, [setup]);
   });
 }

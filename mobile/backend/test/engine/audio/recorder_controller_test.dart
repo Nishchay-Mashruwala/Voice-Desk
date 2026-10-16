@@ -15,6 +15,7 @@ import 'package:mobile_backend/engine/audio/piece_writer.dart';
 import 'package:mobile_backend/engine/audio/recorder_controller.dart';
 import 'package:mobile_backend/engine/audio/recording_notification.dart';
 import 'package:mobile_backend/engine/pipeline/processor.dart';
+import 'package:mobile_backend/engine/speech/speech_setup.dart';
 
 class FakeSource implements AudioSource {
   bool permission = true;
@@ -315,5 +316,15 @@ void main() {
     source.emit(Uint8List(32000 * 2));
     await ctl.stop();
     expect(notification.calls.sublist(notification.calls.length - 2), ['stopped:Weekly', 'hide']);
+  });
+
+  test('a recording is made with the speech setup of now', () async {
+    await container.read(speechSettingsProvider.notifier).setLanguages({Lang.en, Lang.gu});
+    await container.read(speechSettingsProvider.notifier).setAccuracy(Accuracy.accurate);
+    await ctl.start();
+    source.emit(Uint8List(32000));
+    await ctl.stop();
+    expect((await repo.watchAll().first).single.setup,
+        const SpeechSetup(languages: {Lang.en, Lang.gu}, english: EnglishModel.accurate, speakers: true)); // speakers on by default
   });
 }

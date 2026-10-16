@@ -24,6 +24,8 @@ dependencies:
   archive: ^4.5.2
   sherpa_onnx: ^1.13.8
   battery_plus: ^7.1.2
+  # Calls the task AI's native library (lib/engine/tasks/llm_engine.dart); was already here through sherpa_onnx.
+  ffi: ^2.2.0
 
 dev_dependencies:
   flutter_test:

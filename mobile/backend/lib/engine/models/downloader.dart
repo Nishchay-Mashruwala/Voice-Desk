@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:crypto/crypto.dart';
 
 /// Why a download didn't finish: `corrupt`, `network` or `http_<status>`.
@@ -42,9 +43,12 @@ class Downloader {
         have = 0;
       }
       if (have < size) await _download(client, url, part, have, onBytes);
-    } on DownloadFailed {
+    } on DownloadFailed catch (e) {
+      debugPrint('Voice Desk: download of $url failed: ${e.reason}');
       rethrow;
-    } on Exception {
+    } on Exception catch (e) {
+      // The screens say "check the connection"; the log says what happened.
+      debugPrint('Voice Desk: download of $url failed: $e');
       throw const DownloadFailed('network');
     } finally {
       client.close(force: true);
@@ -63,6 +67,9 @@ class Downloader {
     for (var hops = 0; hops < 8; hops++) {
       final req = await client.getUrl(at);
       req.followRedirects = false;
+      // The bytes as they are: a server allowed to gzip (Hugging Face does, for
+      // text files) sends another size, and ranges would count the gzip's bytes.
+      req.headers.set(HttpHeaders.acceptEncodingHeader, 'identity');
       if (have > 0) req.headers.set(HttpHeaders.rangeHeader, 'bytes=$have-');
       final res = await req.close().timeout(readTimeout);
       if (res.isRedirect) {

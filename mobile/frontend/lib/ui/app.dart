@@ -1,8 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:mobile_backend/engine/setup_flag.dart';
 
 import 'record/record_screen.dart';
 import 'settings/settings_screen.dart';
+import 'setup/setup_screen.dart';
 import 'tasks/tasks_screen.dart';
 import 'theme.dart';
 
@@ -20,9 +23,22 @@ class VoiceDeskApp extends StatelessWidget {
       // The desktop app's look, light or dark as the phone is set.
       theme: vdTheme(Brightness.light),
       darkTheme: vdTheme(Brightness.dark),
-      home: const _Tabs(),
+      home: const _Home(),
     );
   }
+}
+
+/// The first-start setup until it has been gone through, then the tabs (never
+/// the tabs first while the flag is read).
+class _Home extends ConsumerWidget {
+  const _Home();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) => switch (ref.watch(setupDoneProvider)) {
+    AsyncData(value: true) || AsyncError() => const _Tabs(),
+    AsyncData() => const SetupScreen(),
+    _ => const Scaffold(),
+  };
 }
 
 class _Tabs extends StatefulWidget {

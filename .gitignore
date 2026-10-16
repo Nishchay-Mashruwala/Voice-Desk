@@ -35,3 +35,6 @@ desktop/backend/app/gen/schemas
 
 # Tauri bundle: VC++ runtime DLLs copied in by build.rs at build time
 desktop/backend/app/redist/
+
+# The task AI's native builds (mobile/native/llm)
+mobile/native/llm/out/
