@@ -647,7 +647,7 @@ fn handle_utterance(app: &AppHandle, st: &Shared, ev: &Value) {
         };
         let status = action.label();
         if let TextAction::Type = action {
-            if let Err(e) = insert::insert_text(&format!("{text} "), &settings.insert_method) {
+            if let Err(e) = insert::insert_text(app, &format!("{text} "), &settings.insert_method) {
                 notice(app, format!("Couldn't type: {e}"));
             }
         }
